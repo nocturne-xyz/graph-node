@@ -1,7 +1,10 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+use graph::data::value::Word;
 
 use never::Never;
 use semver::Version;
@@ -9,7 +12,7 @@ use wasmtime::Trap;
 use web3::types::H160;
 
 use graph::blockchain::Blockchain;
-use graph::components::store::EnsLookup;
+use graph::components::store::{EnsLookup, GetScope, LoadRelatedRequest};
 use graph::components::store::{EntityKey, EntityType};
 use graph::components::subgraph::{
     PoICausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing,
@@ -155,7 +158,7 @@ impl<C: Blockchain> HostExports<C> {
         proof_of_indexing: &SharedProofOfIndexing,
         entity_type: String,
         entity_id: String,
-        data: HashMap<String, Value>,
+        mut data: HashMap<Word, Value>,
         stopwatch: &StopwatchMetrics,
         gas: &GasCounter,
     ) -> Result<(), HostExportError> {
@@ -181,7 +184,39 @@ impl<C: Blockchain> HostExports<C> {
 
         gas.consume_host_fn(gas::STORE_SET.with_args(complexity::Linear, (&key, &data)))?;
 
-        let entity = Entity::from(data);
+        fn check_id(key: &EntityKey, prev_id: &str) -> Result<(), anyhow::Error> {
+            if prev_id != key.entity_id.as_str() {
+                Err(anyhow!(
+                    "Value of {} attribute 'id' conflicts with ID passed to `store.set()`: \
+                {} != {}",
+                    key.entity_type,
+                    prev_id,
+                    key.entity_id,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        // Set the id if there isn't one yet, and make sure that a
+        // previously set id agrees with the one in the `key`
+        match data.get(&store::ID) {
+            Some(Value::String(s)) => check_id(&key, s)?,
+            Some(Value::Bytes(b)) => check_id(&key, &b.to_string())?,
+            Some(_) => {
+                // The validation will catch the type mismatch
+            }
+            None => {
+                let value = state.entity_cache.schema.id_value(&key)?;
+                data.insert(store::ID.clone(), value);
+            }
+        }
+
+        let entity = state
+            .entity_cache
+            .make_entity(data.into_iter().map(|(key, value)| (key, value)))
+            .map_err(|e| HostExportError::Deterministic(anyhow!(e)))?;
+
         state.entity_cache.set(key, entity)?;
 
         Ok(())
@@ -219,13 +254,14 @@ impl<C: Blockchain> HostExports<C> {
         Ok(())
     }
 
-    pub(crate) fn store_get(
+    pub(crate) fn store_get<'a>(
         &self,
-        state: &mut BlockState<C>,
+        state: &'a mut BlockState<C>,
         entity_type: String,
         entity_id: String,
         gas: &GasCounter,
-    ) -> Result<Option<Entity>, anyhow::Error> {
+        scope: GetScope,
+    ) -> Result<Option<Cow<'a, Entity>>, anyhow::Error> {
         let store_key = EntityKey {
             entity_type: EntityType::new(entity_type),
             entity_id: entity_id.into(),
@@ -233,7 +269,33 @@ impl<C: Blockchain> HostExports<C> {
         };
         self.check_entity_type_access(&store_key.entity_type)?;
 
-        let result = state.entity_cache.get(&store_key)?;
+        let result = state.entity_cache.get(&store_key, scope)?;
+
+        gas.consume_host_fn(gas::STORE_GET.with_args(
+            complexity::Linear,
+            (&store_key, result.as_ref().map(|e| e.as_ref())),
+        ))?;
+
+        Ok(result)
+    }
+
+    pub(crate) fn store_load_related(
+        &self,
+        state: &mut BlockState<C>,
+        entity_type: String,
+        entity_id: String,
+        entity_field: String,
+        gas: &GasCounter,
+    ) -> Result<Vec<Entity>, anyhow::Error> {
+        let store_key = LoadRelatedRequest {
+            entity_type: EntityType::new(entity_type),
+            entity_id: entity_id.into(),
+            entity_field: entity_field.into(),
+            causality_region: self.data_source_causality_region,
+        };
+        self.check_entity_type_access(&store_key.entity_type)?;
+
+        let result = state.entity_cache.load_related(&store_key)?;
         gas.consume_host_fn(gas::STORE_GET.with_args(complexity::Linear, (&store_key, &result)))?;
 
         Ok(result)
@@ -485,7 +547,7 @@ impl<C: Blockchain> HostExports<C> {
             gas::BIG_MATH_GAS_OP
                 .with_args(complexity::Exponential, (&x, (exp as f32).log2() as u8)),
         )?;
-        Ok(x.pow(exp))
+        Ok(x.pow(exp)?)
     }
 
     pub(crate) fn big_int_from_string(
@@ -601,7 +663,7 @@ impl<C: Blockchain> HostExports<C> {
         x: BigDecimal,
         y: BigDecimal,
         gas: &GasCounter,
-    ) -> Result<bool, DeterministicHostError> {
+    ) -> Result<bool, HostExportError> {
         gas.consume_host_fn(gas::BIG_MATH_GAS_OP.with_args(complexity::Min, (&x, &y)))?;
         Ok(x == y)
     }
@@ -611,7 +673,7 @@ impl<C: Blockchain> HostExports<C> {
         x: BigDecimal,
         gas: &GasCounter,
     ) -> Result<String, DeterministicHostError> {
-        gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Size, &x))?;
+        gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Mul, (&x, &x)))?;
         Ok(x.to_string())
     }
 
@@ -677,7 +739,12 @@ impl<C: Blockchain> HostExports<C> {
         Ok(())
     }
 
-    pub(crate) fn ens_name_by_hash(&self, hash: &str) -> Result<Option<String>, anyhow::Error> {
+    pub(crate) fn ens_name_by_hash(
+        &self,
+        hash: &str,
+        gas: &GasCounter,
+    ) -> Result<Option<String>, anyhow::Error> {
+        gas.consume_host_fn(gas::ENS_NAME_BY_HASH)?;
         Ok(self.ens_lookup.find_name(hash)?)
     }
 
@@ -729,13 +796,9 @@ impl<C: Blockchain> HostExports<C> {
     pub(crate) fn data_source_context(
         &self,
         gas: &GasCounter,
-    ) -> Result<Entity, DeterministicHostError> {
+    ) -> Result<Option<DataSourceContext>, DeterministicHostError> {
         gas.consume_host_fn(Gas::new(gas::DEFAULT_BASE_COST))?;
-        Ok(self
-            .data_source_context
-            .as_ref()
-            .clone()
-            .unwrap_or_default())
+        Ok(self.data_source_context.as_ref().clone())
     }
 
     pub(crate) fn json_from_bytes(
@@ -743,8 +806,18 @@ impl<C: Blockchain> HostExports<C> {
         bytes: &Vec<u8>,
         gas: &GasCounter,
     ) -> Result<serde_json::Value, DeterministicHostError> {
-        gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(gas::complexity::Size, &bytes))?;
-        serde_json::from_reader(bytes.as_slice())
+        // Max JSON size is 10MB.
+        const MAX_JSON_SIZE: usize = 10_000_000;
+
+        gas.consume_host_fn(gas::JSON_FROM_BYTES.with_args(gas::complexity::Size, &bytes))?;
+
+        if bytes.len() > MAX_JSON_SIZE {
+            return Err(DeterministicHostError::Other(
+                anyhow!("JSON size exceeds max size of {}", MAX_JSON_SIZE).into(),
+            ));
+        }
+
+        serde_json::from_slice(bytes.as_slice())
             .map_err(|e| DeterministicHostError::from(Error::from(e)))
     }
 
@@ -827,6 +900,64 @@ fn bytes_to_string(logger: &Logger, bytes: Vec<u8>) -> String {
     s.trim_end_matches('\u{0000}').to_string()
 }
 
+/// Expose some host functions for testing only
+#[cfg(debug_assertions)]
+pub mod test_support {
+    use std::{borrow::Cow, collections::HashMap, sync::Arc};
+
+    use graph::{
+        blockchain::Blockchain,
+        components::{store::GetScope, subgraph::SharedProofOfIndexing},
+        data::value::Word,
+        prelude::{BlockState, Entity, StopwatchMetrics, Value},
+        runtime::{gas::GasCounter, HostExportError},
+        slog::Logger,
+    };
+
+    use crate::MappingContext;
+
+    pub struct HostExports<C: Blockchain>(Arc<super::HostExports<C>>);
+
+    impl<C: Blockchain> HostExports<C> {
+        pub fn new(ctx: &MappingContext<C>) -> Self {
+            HostExports(ctx.host_exports.clone())
+        }
+
+        pub fn store_set(
+            &self,
+            logger: &Logger,
+            state: &mut BlockState<C>,
+            proof_of_indexing: &SharedProofOfIndexing,
+            entity_type: String,
+            entity_id: String,
+            data: HashMap<Word, Value>,
+            stopwatch: &StopwatchMetrics,
+            gas: &GasCounter,
+        ) -> Result<(), HostExportError> {
+            self.0.store_set(
+                logger,
+                state,
+                proof_of_indexing,
+                entity_type,
+                entity_id,
+                data,
+                stopwatch,
+                gas,
+            )
+        }
+
+        pub fn store_get<'a>(
+            &self,
+            state: &'a mut BlockState<C>,
+            entity_type: String,
+            entity_id: String,
+            gas: &GasCounter,
+        ) -> Result<Option<Cow<'a, Entity>>, anyhow::Error> {
+            self.0
+                .store_get(state, entity_type, entity_id, gas, GetScope::Store)
+        }
+    }
+}
 #[test]
 fn test_string_to_h160_with_0x() {
     assert_eq!(

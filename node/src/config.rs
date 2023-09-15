@@ -2,6 +2,7 @@ use graph::{
     anyhow::Error,
     blockchain::BlockchainKind,
     firehose::{SubgraphLimit, SUBGRAPHS_PER_CONN},
+    itertools::Itertools,
     prelude::{
         anyhow::{anyhow, bail, Context, Result},
         info,
@@ -10,7 +11,7 @@ use graph::{
             de::{self, value, SeqAccess, Visitor},
             Deserialize, Deserializer, Serialize,
         },
-        serde_json, Logger, NodeId, StoreError,
+        serde_json, serde_regex, toml, Logger, NodeId, StoreError,
     },
 };
 use graph_chain_ethereum::{self as ethereum, NodeCapabilities};
@@ -421,14 +422,14 @@ impl ChainSection {
         Ok(Self { ingestor, chains })
     }
 
-    pub fn provider_urls(&self) -> Vec<String> {
+    pub fn providers(&self) -> Vec<String> {
         self.chains
             .values()
             .flat_map(|chain| {
                 chain
                     .providers
                     .iter()
-                    .map(|p| p.details.url())
+                    .map(|p| p.label.clone())
                     .collect::<Vec<String>>()
             })
             .collect()
@@ -518,11 +519,42 @@ fn default_blockchain_kind() -> BlockchainKind {
 
 impl Chain {
     fn validate(&mut self) -> Result<()> {
-        // `Config` validates that `self.shard` references a configured shard
+        let mut labels = self.providers.iter().map(|p| &p.label).collect_vec();
+        labels.sort();
+        labels.dedup();
+        if labels.len() != self.providers.len() {
+            return Err(anyhow!("Provider labels must be unique"));
+        }
 
+        // `Config` validates that `self.shard` references a configured shard
         for provider in self.providers.iter_mut() {
             provider.validate()?
         }
+
+        if !matches!(self.protocol, BlockchainKind::Substreams) {
+            let has_only_substreams_providers = self
+                .providers
+                .iter()
+                .all(|provider| matches!(provider.details, ProviderDetails::Substreams(_)));
+            if has_only_substreams_providers {
+                bail!(
+                    "{} protocol requires an rpc or firehose endpoint defined",
+                    self.protocol
+                );
+            }
+        }
+
+        // When using substreams protocol, only substreams endpoints are allowed
+        if matches!(self.protocol, BlockchainKind::Substreams) {
+            let has_non_substreams_providers = self
+                .providers
+                .iter()
+                .any(|provider| !matches!(provider.details, ProviderDetails::Substreams(_)));
+            if has_non_substreams_providers {
+                bail!("Substreams protocol only supports substreams providers");
+            }
+        }
+
         Ok(())
     }
 }
@@ -561,21 +593,6 @@ pub enum ProviderDetails {
     Web3(Web3Provider),
     Substreams(FirehoseProvider),
     Web3Call(Web3Provider),
-}
-
-impl ProviderDetails {
-    pub fn url(&self) -> String {
-        let url = match self {
-            ProviderDetails::Substreams(firehose) | ProviderDetails::Firehose(firehose) => {
-                firehose.url.clone()
-            }
-            ProviderDetails::Web3(web3) | ProviderDetails::Web3Call(web3) => web3.url.to_string(),
-        };
-
-        // parsing and printing here normalizes the urls so we don't have
-        // mismatches later on.
-        url.parse::<Url>().expect("failed to parse url").to_string()
-    }
 }
 
 const FIREHOSE_FILTER_FEATURE: &str = "filters";
@@ -1162,7 +1179,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::config::Web3Rule;
+    use crate::config::{ChainSection, Web3Rule};
 
     use super::{
         Chain, Config, FirehoseProvider, Provider, ProviderDetails, Transport, Web3Provider,
@@ -1170,7 +1187,7 @@ mod tests {
     use graph::blockchain::BlockchainKind;
     use graph::firehose::SubgraphLimit;
     use graph::prelude::regex::Regex;
-    use graph::prelude::NodeId;
+    use graph::prelude::{toml, NodeId};
     use http::{HeaderMap, HeaderValue};
     use std::collections::BTreeSet;
     use std::fs::read_to_string;
@@ -1318,6 +1335,47 @@ mod tests {
             true,
             "{}",
             err_str
+        );
+    }
+
+    #[test]
+    fn fails_if_non_substreams_provider_for_substreams_protocol() {
+        let mut actual = toml::from_str::<ChainSection>(
+            r#"
+            ingestor = "block_ingestor_node"
+            [mainnet]
+            shard = "primary"
+            protocol = "substreams"
+            provider = [
+              { label = "firehose", details = { type = "firehose", url = "http://127.0.0.1:8888", token = "TOKEN", features = ["filters"] }},
+            ]
+        "#,
+        )
+        .unwrap();
+        let err = actual.validate().unwrap_err().to_string();
+
+        assert!(err.contains("only supports substreams providers"), "{err}");
+    }
+
+    #[test]
+    fn fails_if_only_substreams_provider_for_non_substreams_protocol() {
+        let mut actual = toml::from_str::<ChainSection>(
+            r#"
+            ingestor = "block_ingestor_node"
+            [mainnet]
+            shard = "primary"
+            protocol = "ethereum"
+            provider = [
+              { label = "firehose", details = { type = "substreams", url = "http://127.0.0.1:8888", token = "TOKEN", features = ["filters"] }},
+            ]
+        "#,
+        )
+        .unwrap();
+        let err = actual.validate().unwrap_err().to_string();
+
+        assert!(
+            err.contains("ethereum protocol requires an rpc or firehose endpoint defined"),
+            "{err}"
         );
     }
 
@@ -1475,7 +1533,7 @@ mod tests {
                 details = { type = "firehose", url = "http://localhost:9000" }
                 match = [
                   { name = "some_node_.*", limit = 10 },
-                  { name = "other_node_.*", limit = 0 } ] 
+                  { name = "other_node_.*", limit = 0 } ]
             "#,
         )
         .unwrap();
@@ -1513,7 +1571,7 @@ mod tests {
                 details = { type = "substreams", url = "http://localhost:9000" }
                 match = [
                   { name = "some_node_.*", limit = 101 },
-                  { name = "other_node_.*", limit = 0 } ] 
+                  { name = "other_node_.*", limit = 0 } ]
             "#,
         )
         .unwrap();
@@ -1551,7 +1609,7 @@ mod tests {
                 details = { type = "substreams", url = "http://localhost:9000" }
                 match = [
                   { name = "some_node_.*", limit = 10 },
-                  { name = "other_node_.*", limit = 0 } ] 
+                  { name = "other_node_.*", limit = 0 } ]
             "#,
         )
         .unwrap();
@@ -1589,7 +1647,7 @@ mod tests {
                 details = { type = "substreams", url = "http://localhost:9000" }
                 match = [
                   { name = "some_node_.*", limit = 101 },
-                  { name = "other_node_.*", limit = 0 } ] 
+                  { name = "other_node_.*", limit = 0 } ]
             "#,
         )
         .unwrap();
@@ -1716,5 +1774,56 @@ mod tests {
     fn web3rules_have_the_right_order() {
         assert!(SubgraphLimit::Unlimited > SubgraphLimit::Limit(10));
         assert!(SubgraphLimit::Limit(10) > SubgraphLimit::Disabled);
+    }
+
+    #[test]
+    fn duplicated_labels_are_not_allowed_within_chain() {
+        let mut actual = toml::from_str::<ChainSection>(
+            r#"
+            ingestor = "block_ingestor_node"
+            [mainnet]
+            shard = "vip"
+            provider = [
+                { label = "mainnet1", url = "http://127.0.0.1", features = [], headers = { Authorization = "Bearer foo" } },
+                { label = "mainnet1", url = "http://127.0.0.1", features = [ "archive", "traces" ] }
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let err = actual.validate();
+        assert_eq!(true, err.is_err());
+        let err = err.unwrap_err();
+        assert_eq!(
+            true,
+            err.to_string().contains("unique"),
+            "result: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn duplicated_labels_are_allowed_on_different_chain() {
+        let mut actual = toml::from_str::<ChainSection>(
+            r#"
+            ingestor = "block_ingestor_node"
+            [mainnet]
+            shard = "vip"
+            provider = [
+                { label = "mainnet1", url = "http://127.0.0.1", features = [], headers = { Authorization = "Bearer foo" } },
+                { label = "mainnet2", url = "http://127.0.0.1", features = [ "archive", "traces" ] }
+            ]
+            [mainnet2]
+            shard = "vip"
+            provider = [
+                { label = "mainnet1", url = "http://127.0.0.1", features = [], headers = { Authorization = "Bearer foo" } },
+                { label = "mainnet2", url = "http://127.0.0.1", features = [ "archive", "traces" ] }
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let result = actual.validate();
+        assert_eq!(true, result.is_ok(), "error: {:?}", result.unwrap_err());
     }
 }

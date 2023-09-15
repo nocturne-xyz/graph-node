@@ -6,10 +6,11 @@ use graph::data::graphql::TypeExt as _;
 use graph::data::value::Object;
 use graph::data::value::Value as DataValue;
 use graph::prelude::*;
+use graph::schema::ast::{self as sast, FilterOp};
+use graph::schema::ApiSchema;
 use graph::{components::store::EntityType, data::graphql::ObjectOrInterface};
 
 use crate::execution::ast as a;
-use crate::schema::ast::{self as sast, FilterOp};
 
 use super::prefetch::SelectedAttributes;
 
@@ -561,22 +562,47 @@ fn build_order_by(
                     })
             }
             OrderByValue::Child(parent_field_name, child_field_name) => {
-                if entity.is_interface() {
-                    return Err(QueryExecutionError::OrderByNotSupportedError(
-                        entity.name().to_owned(),
-                        parent_field_name,
-                    ));
-                }
+                // Finds the field that connects the parent entity with the child entity.
+                // In the case of an interface, we need to find the field on one of the types that implement the interface,
+                // as the `@derivedFrom` directive is only allowed on object types.
+                let field = match entity {
+                    ObjectOrInterface::Object(_) => {
+                        sast::get_field(entity, parent_field_name.as_str()).ok_or_else(|| {
+                            QueryExecutionError::EntityFieldError(
+                                entity.name().to_owned(),
+                                parent_field_name.clone(),
+                            )
+                        })?
+                    }
+                    ObjectOrInterface::Interface(_) => {
+                        let object_types = schema
+                            .types_for_interface()
+                            .get(&EntityType::new(entity.name().to_string()))
+                            .ok_or(QueryExecutionError::EntityFieldError(
+                                entity.name().to_owned(),
+                                parent_field_name.clone(),
+                            ))?;
 
-                let field =
-                    sast::get_field(entity, parent_field_name.as_str()).ok_or_else(|| {
-                        QueryExecutionError::EntityFieldError(
-                            entity.name().to_owned(),
-                            parent_field_name.clone(),
-                        )
-                    })?;
+                        if let Some(first_entity) = object_types.first() {
+                            sast::get_field(first_entity, parent_field_name.as_str()).ok_or_else(
+                                || {
+                                    QueryExecutionError::EntityFieldError(
+                                        entity.name().to_owned(),
+                                        parent_field_name.clone(),
+                                    )
+                                },
+                            )?
+                        } else {
+                            Err(QueryExecutionError::EntityFieldError(
+                                entity.name().to_owned(),
+                                parent_field_name.clone(),
+                            ))?
+                        }
+                    }
+                };
                 let derived = field.is_derived();
                 let base_type = field.field_type.get_base_type();
+
                 let child_entity = schema
                     .object_or_interface(base_type)
                     .ok_or_else(|| QueryExecutionError::NamedTypeError(base_type.into()))?;
@@ -749,13 +775,14 @@ mod tests {
         components::store::EntityType,
         data::value::Object,
         prelude::{
-            r, ApiSchema, AttributeNames, DeploymentHash, EntityCollection, EntityFilter,
-            EntityRange, Schema, Value, ValueType, BLOCK_NUMBER_MAX,
+            r, AttributeNames, DeploymentHash, EntityCollection, EntityFilter, EntityRange, Value,
+            ValueType, BLOCK_NUMBER_MAX,
         },
         prelude::{
             s::{self, Directive, Field, InputValue, ObjectType, Type, Value as SchemaValue},
             EntityOrder,
         },
+        schema::{ApiSchema, Schema},
     };
     use graphql_parser::Pos;
     use std::{collections::BTreeMap, iter::FromIterator, sync::Arc};
@@ -1150,7 +1177,7 @@ mod tests {
         let query_field = default_field_with(
             "where",
             r::Value::Object(Object::from_iter(vec![(
-                "name_ends_with".to_string(),
+                "name_ends_with".into(),
                 r::Value::String("ello".to_string()),
             )])),
         );
@@ -1183,9 +1210,9 @@ mod tests {
         let query_field = default_field_with(
             "where",
             r::Value::Object(Object::from_iter(vec![(
-                "_change_block".to_string(),
+                "_change_block".into(),
                 r::Value::Object(Object::from_iter(vec![(
-                    "number_gte".to_string(),
+                    "number_gte".into(),
                     r::Value::Int(10),
                 )])),
             )])),

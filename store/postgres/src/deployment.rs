@@ -18,8 +18,9 @@ use graph::{
     components::store::EntityType,
     prelude::{
         anyhow, bigdecimal::ToPrimitive, hex, web3::types::H256, BigDecimal, BlockNumber, BlockPtr,
-        DeploymentHash, DeploymentState, Schema, StoreError,
+        DeploymentHash, DeploymentState, StoreError,
     },
+    schema::InputSchema,
 };
 use graph::{
     data::subgraph::{
@@ -179,6 +180,9 @@ table! {
         // Names stored as present in the schema, not in snake case.
         entities_with_causality_region -> Array<Text>,
         on_sync -> Nullable<Text>,
+        // How many blocks of history to keep, defaults to `i32::max` for
+        // unlimited history
+        history_blocks -> Integer,
     }
 }
 
@@ -291,19 +295,19 @@ pub fn debug_fork(
     }
 }
 
-pub fn schema(conn: &PgConnection, site: &Site) -> Result<(Schema, bool), StoreError> {
+pub fn schema(conn: &PgConnection, site: &Site) -> Result<(InputSchema, bool), StoreError> {
     use subgraph_manifest as sm;
     let (s, use_bytea_prefix) = sm::table
         .select((sm::schema, sm::use_bytea_prefix))
         .filter(sm::id.eq(site.id))
         .first::<(String, bool)>(conn)?;
-    Schema::parse(s.as_str(), site.deployment.clone())
+    InputSchema::parse(s.as_str(), site.deployment.clone())
         .map_err(StoreError::Unknown)
         .map(|schema| (schema, use_bytea_prefix))
 }
 
 pub struct ManifestInfo {
-    pub input_schema: Schema,
+    pub input_schema: InputSchema,
     pub description: Option<String>,
     pub repository: Option<String>,
     pub spec_version: String,
@@ -329,7 +333,7 @@ impl ManifestInfo {
             ))
             .filter(sm::id.eq(site.id))
             .first(conn)?;
-        let input_schema = Schema::parse(s.as_str(), site.deployment.clone())?;
+        let input_schema = InputSchema::parse(s.as_str(), site.deployment.clone())?;
 
         // Using the features field to store the instrument flag is a bit
         // backhanded, but since this will be used very rarely, should not
@@ -344,6 +348,30 @@ impl ManifestInfo {
             instrument,
         })
     }
+}
+
+// Return how many blocks of history this subgraph should keep
+pub fn history_blocks(conn: &PgConnection, site: &Site) -> Result<BlockNumber, StoreError> {
+    use subgraph_manifest as sm;
+    sm::table
+        .select(sm::history_blocks)
+        .filter(sm::id.eq(site.id))
+        .first::<BlockNumber>(conn)
+        .map_err(StoreError::from)
+}
+
+pub fn set_history_blocks(
+    conn: &PgConnection,
+    site: &Site,
+    history_blocks: BlockNumber,
+) -> Result<(), StoreError> {
+    use subgraph_manifest as sm;
+
+    update(sm::table.filter(sm::id.eq(site.id)))
+        .set(sm::history_blocks.eq(history_blocks))
+        .execute(conn)
+        .map(|_| ())
+        .map_err(StoreError::from)
 }
 
 #[allow(dead_code)]
@@ -383,7 +411,7 @@ pub fn transact_block(
     ptr: &BlockPtr,
     firehose_cursor: &FirehoseCursor,
     count: i32,
-) -> Result<(), StoreError> {
+) -> Result<BlockNumber, StoreError> {
     use crate::diesel::BoolExpressionMethods;
     use subgraph_deployment as d;
 
@@ -392,7 +420,7 @@ pub fn transact_block(
 
     let count_sql = entity_count_sql(count);
 
-    let row_count = update(
+    let rows = update(
         d::table.filter(d::id.eq(site.id)).filter(
             // Asserts that the processing direction is forward.
             d::latest_ethereum_block_number
@@ -407,12 +435,13 @@ pub fn transact_block(
         d::entity_count.eq(sql(&count_sql)),
         d::current_reorg_depth.eq(0),
     ))
-    .execute(conn)
+    .returning(d::earliest_block_number)
+    .get_results::<BlockNumber>(conn)
     .map_err(StoreError::from)?;
 
-    match row_count {
+    match rows.len() {
         // Common case: A single row was updated.
-        1 => Ok(()),
+        1 => Ok(rows[0]),
 
         // No matching rows were found. This is an error. By the filter conditions, this can only be
         // due to a missing deployment (which `block_ptr` catches) or duplicate block processing.
@@ -746,7 +775,29 @@ pub fn fail(
 ) -> Result<(), StoreError> {
     let error_id = insert_subgraph_error(conn, error)?;
 
-    update_deployment_status(conn, id, SubgraphHealth::Failed, Some(error_id))?;
+    update_deployment_status(conn, id, SubgraphHealth::Failed, Some(error_id), None)?;
+
+    Ok(())
+}
+
+pub fn update_non_fatal_errors(
+    conn: &PgConnection,
+    deployment_id: &DeploymentHash,
+    health: SubgraphHealth,
+    non_fatal_errors: Option<&[SubgraphError]>,
+) -> Result<(), StoreError> {
+    let error_ids = non_fatal_errors.map(|errors| {
+        errors
+            .iter()
+            .map(|error| {
+                hex::encode(stable_hash_legacy::utils::stable_hash::<SetHasher, _>(
+                    error,
+                ))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    update_deployment_status(conn, deployment_id, health, None, error_ids)?;
 
     Ok(())
 }
@@ -773,6 +824,7 @@ pub fn update_deployment_status(
     deployment_id: &DeploymentHash,
     health: SubgraphHealth,
     fatal_error: Option<String>,
+    non_fatal_errors: Option<Vec<String>>,
 ) -> Result<(), StoreError> {
     use subgraph_deployment as d;
 
@@ -781,24 +833,28 @@ pub fn update_deployment_status(
             d::failed.eq(health.is_failed()),
             d::health.eq(health),
             d::fatal_error.eq::<Option<String>>(fatal_error),
+            d::non_fatal_errors.eq::<Vec<String>>(non_fatal_errors.unwrap_or(vec![])),
         ))
         .execute(conn)
         .map(|_| ())
         .map_err(StoreError::from)
 }
 
-/// Insert the errors and check if the subgraph needs to be set as unhealthy.
+/// Insert the errors and check if the subgraph needs to be set as
+/// unhealthy. The `latest_block` is only used to check whether the subgraph
+/// is healthy as of that block; errors are inserted according to the
+/// `block_ptr` they contain
 pub(crate) fn insert_subgraph_errors(
     conn: &PgConnection,
     id: &DeploymentHash,
     deterministic_errors: &[SubgraphError],
-    block: BlockNumber,
+    latest_block: BlockNumber,
 ) -> Result<(), StoreError> {
     for error in deterministic_errors {
         insert_subgraph_error(conn, error)?;
     }
 
-    check_health(conn, id, block)
+    check_health(conn, id, latest_block)
 }
 
 #[cfg(debug_assertions)]
@@ -916,11 +972,7 @@ pub(crate) fn copy_errors(
 ) -> Result<usize, StoreError> {
     use subgraph_error as e;
 
-    let src_nsp = if src.shard == dst.shard {
-        "subgraphs".to_string()
-    } else {
-        ForeignServer::metadata_schema(&src.shard)
-    };
+    let src_nsp = ForeignServer::metadata_schema_in(&src.shard, &dst.shard);
 
     // Check whether there are any errors for dst which indicates we already
     // did copy
@@ -1019,11 +1071,13 @@ pub fn create_deployment(
                 schema,
                 raw_yaml,
                 entities_with_causality_region,
+                history_blocks,
             },
         start_block,
         graft_base,
         graft_block,
         debug_fork,
+        history_blocks: history_blocks_override,
     } = deployment;
     let earliest_block_number = start_block.as_ref().map(|ptr| ptr.number).unwrap_or(0);
     let entities_with_causality_region = Vec::from_iter(entities_with_causality_region.into_iter());
@@ -1063,6 +1117,7 @@ pub fn create_deployment(
         m::start_block_number.eq(start_block.as_ref().map(|ptr| ptr.number)),
         m::raw_yaml.eq(raw_yaml),
         m::entities_with_causality_region.eq(entities_with_causality_region),
+        m::history_blocks.eq(history_blocks_override.unwrap_or(history_blocks)),
     );
 
     if exists && replace {
@@ -1118,6 +1173,11 @@ pub fn set_entity_count(
     Ok(())
 }
 
+/// Set the earliest block of `site` to the larger of `earliest_block` and
+/// the current value. This means that the `earliest_block_number` can never
+/// go backwards, only forward. This is important so that copying into
+/// `site` can not move the earliest block backwards if `site` was also
+/// pruned while the copy was running.
 pub fn set_earliest_block(
     conn: &PgConnection,
     site: &Site,
@@ -1127,7 +1187,28 @@ pub fn set_earliest_block(
 
     update(d::table.filter(d::id.eq(site.id)))
         .set(d::earliest_block_number.eq(earliest_block))
+        .filter(d::earliest_block_number.lt(earliest_block))
         .execute(conn)?;
+    Ok(())
+}
+
+/// Copy the `earliest_block` attribute from `src` to `dst`. The copy might
+/// go across shards and use the metadata tables mapped into the shard for
+/// `conn` which must be the shard for `dst`
+pub fn copy_earliest_block(conn: &PgConnection, src: &Site, dst: &Site) -> Result<(), StoreError> {
+    use subgraph_deployment as d;
+
+    let src_nsp = ForeignServer::metadata_schema_in(&src.shard, &dst.shard);
+
+    let query = format!(
+        "(select earliest_block_number from {src_nsp}.subgraph_deployment where id = {})",
+        src.id
+    );
+
+    update(d::table.filter(d::id.eq(dst.id)))
+        .set(d::earliest_block_number.eq(sql(&query)))
+        .execute(conn)?;
+
     Ok(())
 }
 

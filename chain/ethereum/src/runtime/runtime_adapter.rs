@@ -4,9 +4,11 @@ use crate::data_source::MappingABI;
 use crate::{
     capabilities::NodeCapabilities, network::EthereumNetworkAdapters, Chain, DataSource,
     EthereumAdapter, EthereumAdapterTrait, EthereumContractCall, EthereumContractCallError,
+    ENV_VARS,
 };
 use anyhow::{Context, Error};
 use blockchain::HostFn;
+use graph::blockchain::ChainIdentifier;
 use graph::runtime::gas::Gas;
 use graph::runtime::{AscIndexId, IndexForAscTypeId};
 use graph::{
@@ -24,6 +26,16 @@ use graph_runtime_wasm::asc_abi::class::{AscEnumArray, EthereumValueKind};
 
 use super::abi::{AscUnresolvedContractCall, AscUnresolvedContractCall_0_0_4};
 
+/// Gas limit for `eth_call`. The value of 50_000_000 is a protocol-wide parameter so this
+/// should be changed only for debugging purposes and never on an indexer in the network. This
+/// value was chosen because it is the Geth default
+/// https://github.com/ethereum/go-ethereum/blob/e4b687cf462870538743b3218906940ae590e7fd/eth/ethconfig/config.go#L91.
+/// It is not safe to set something higher because Geth will silently override the gas limit
+/// with the default. This means that we do not support indexing against a Geth node with
+/// `RPCGasCap` set below 50 million.
+// See also f0af4ab0-6b7c-4b68-9141-5b79346a5f61.
+const ETH_CALL_GAS: u32 = 50_000_000;
+
 // When making an ethereum call, the maximum ethereum gas is ETH_CALL_GAS which is 50 million. One
 // unit of Ethereum gas is at least 100ns according to these benchmarks [1], so 1000 of our gas. In
 // the worst case an Ethereum call could therefore consume 50 billion of our gas. However the
@@ -37,23 +49,44 @@ pub const ETHEREUM_CALL: Gas = Gas::new(5_000_000_000);
 pub struct RuntimeAdapter {
     pub eth_adapters: Arc<EthereumNetworkAdapters>,
     pub call_cache: Arc<dyn EthereumCallCache>,
+    pub chain_identifier: Arc<ChainIdentifier>,
 }
 
 impl blockchain::RuntimeAdapter<Chain> for RuntimeAdapter {
     fn host_fns(&self, ds: &DataSource) -> Result<Vec<HostFn>, Error> {
         let abis = ds.mapping.abis.clone();
         let call_cache = self.call_cache.cheap_clone();
-        // Ethereum calls should prioritise call-only adapters if one is available.
-        let eth_adapter = self.eth_adapters.call_or_cheapest(Some(&NodeCapabilities {
-            archive: ds.mapping.requires_archive()?,
-            traces: false,
-        }))?;
+        let eth_adapters = self.eth_adapters.cheap_clone();
+        let archive = ds.mapping.requires_archive()?;
+
+        // Check if the current network version is in the eth_call_no_gas list
+        let should_skip_gas = ENV_VARS
+            .eth_call_no_gas
+            .contains(&self.chain_identifier.net_version);
+
+        let eth_call_gas = if should_skip_gas {
+            None
+        } else {
+            Some(ETH_CALL_GAS)
+        };
 
         let ethereum_call = HostFn {
             name: "ethereum.call",
             func: Arc::new(move |ctx, wasm_ptr| {
-                ethereum_call(&eth_adapter, call_cache.cheap_clone(), ctx, wasm_ptr, &abis)
-                    .map(|ptr| ptr.wasm_ptr())
+                // Ethereum calls should prioritise call-only adapters if one is available.
+                let eth_adapter = eth_adapters.call_or_cheapest(Some(&NodeCapabilities {
+                    archive,
+                    traces: false,
+                }))?;
+                ethereum_call(
+                    &eth_adapter,
+                    call_cache.cheap_clone(),
+                    ctx,
+                    wasm_ptr,
+                    &abis,
+                    eth_call_gas,
+                )
+                .map(|ptr| ptr.wasm_ptr())
             }),
         };
 
@@ -68,6 +101,7 @@ fn ethereum_call(
     ctx: HostFnCtx<'_>,
     wasm_ptr: u32,
     abis: &[Arc<MappingABI>],
+    eth_call_gas: Option<u32>,
 ) -> Result<AscEnumArray<EthereumValueKind>, HostExportError> {
     ctx.gas.consume_host_fn(ETHEREUM_CALL)?;
 
@@ -75,9 +109,9 @@ fn ethereum_call(
     // function signature; subgraphs using an apiVersion < 0.0.4 don't pass
     // the signature along with the call.
     let call: UnresolvedContractCall = if ctx.heap.api_version() >= Version::new(0, 0, 4) {
-        asc_get::<_, AscUnresolvedContractCall_0_0_4, _>(ctx.heap, wasm_ptr.into(), &ctx.gas)?
+        asc_get::<_, AscUnresolvedContractCall_0_0_4, _>(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?
     } else {
-        asc_get::<_, AscUnresolvedContractCall, _>(ctx.heap, wasm_ptr.into(), &ctx.gas)?
+        asc_get::<_, AscUnresolvedContractCall, _>(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?
     };
 
     let result = eth_call(
@@ -87,6 +121,7 @@ fn ethereum_call(
         &ctx.block_ptr,
         call,
         abis,
+        eth_call_gas,
     )?;
     match result {
         Some(tokens) => Ok(asc_new(ctx.heap, tokens.as_slice(), &ctx.gas)?),
@@ -102,6 +137,7 @@ fn eth_call(
     block_ptr: &BlockPtr,
     unresolved_call: UnresolvedContractCall,
     abis: &[Arc<MappingABI>],
+    eth_call_gas: Option<u32>,
 ) -> Result<Option<Vec<Token>>, HostExportError> {
     let start_time = Instant::now();
 
@@ -161,6 +197,7 @@ fn eth_call(
         block_ptr: block_ptr.cheap_clone(),
         function: function.clone(),
         args: unresolved_call.function_args.clone(),
+        gas: eth_call_gas,
     };
 
     // Run Ethereum call in tokio runtime

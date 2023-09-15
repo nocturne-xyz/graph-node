@@ -16,7 +16,9 @@ use graph::anyhow::{bail, format_err};
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::{BlockchainKind, BlockchainMap};
 use graph::cheap_clone::CheapClone;
+use graph::components::link_resolver::{ArweaveClient, FileSizeLimit};
 use graph::components::store::{BlockStore as _, DeploymentLocator};
+use graph::components::subgraph::Settings;
 use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
 use graph::firehose::FirehoseEndpoints;
@@ -27,7 +29,7 @@ use graph::prelude::{
 };
 use graph::slog::{debug, info, Logger};
 use graph_chain_ethereum as ethereum;
-use graph_core::polling_monitor::ipfs_service;
+use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_core::{
     LinkResolver, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
     SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar,
@@ -47,6 +49,7 @@ pub async fn run(
     store_builder: StoreBuilder,
     network_name: String,
     ipfs_url: Vec<String>,
+    arweave_url: String,
     config: Config,
     metrics_ctx: MetricsContext,
     node_id: NodeId,
@@ -71,10 +74,24 @@ pub async fn run(
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
+    let arweave_resolver = Arc::new(ArweaveClient::new(
+        logger.cheap_clone(),
+        arweave_url.parse().expect("invalid arweave url"),
+    ));
+    let arweave_service = arweave_service(
+        arweave_resolver.cheap_clone(),
+        env_vars.mappings.ipfs_timeout,
+        env_vars.mappings.ipfs_request_limit,
+        match env_vars.mappings.max_ipfs_file_bytes {
+            0 => FileSizeLimit::Unlimited,
+            n => FileSizeLimit::MaxBytes(n as u64),
+        },
+    );
 
     let endpoint_metrics = Arc::new(EndpointMetrics::new(
         logger.clone(),
-        &config.chains.provider_urls(),
+        &config.chains.providers(),
+        metrics_registry.cheap_clone(),
     ));
 
     // Convert the clients into a link resolver. Since we want to get past
@@ -82,10 +99,15 @@ pub async fn run(
     let link_resolver = Arc::new(LinkResolver::new(ipfs_clients, env_vars.cheap_clone()));
 
     let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(metrics_registry.clone()));
-    let eth_networks =
-        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, &config, &network_name)
-            .await
-            .expect("Failed to parse Ethereum networks");
+    let eth_networks = create_ethereum_networks_for_chain(
+        &logger,
+        eth_rpc_metrics,
+        &config,
+        &network_name,
+        endpoint_metrics.cheap_clone(),
+    )
+    .await
+    .expect("Failed to parse Ethereum networks");
     let firehose_networks_by_kind =
         create_firehose_networks(logger.clone(), &config, endpoint_metrics);
     let firehose_networks = firehose_networks_by_kind.get(&BlockchainKind::Ethereum);
@@ -104,7 +126,7 @@ pub async fn run(
 
     let eth_adapters2 = eth_adapters.clone();
 
-    let (_, ethereum_idents) = connect_ethereum_networks(&logger, eth_networks).await;
+    let (_, ethereum_idents) = connect_ethereum_networks(&logger, eth_networks).await?;
     // let (near_networks, near_idents) = connect_firehose_networks::<NearFirehoseHeaderOnlyBlock>(
     //     &logger,
     //     firehose_networks_by_kind
@@ -145,8 +167,9 @@ pub async fn run(
         Arc::new(EthereumRuntimeAdapter {
             call_cache: chain_store.cheap_clone(),
             eth_adapters: Arc::new(eth_adapters2),
+            chain_identifier: Arc::new(chain_store.chain_identifier.clone()),
         }),
-        ethereum::ENV_VARS.reorg_threshold,
+        graph::env::ENV_VARS.reorg_threshold,
         ethereum::ENV_VARS.ingestor_polling_interval,
         // We assume the tested chain is always ingestible for now
         true,
@@ -169,6 +192,7 @@ pub async fn run(
         metrics_registry.clone(),
         link_resolver.cheap_clone(),
         ipfs_service,
+        arweave_service,
         static_filters,
     );
 
@@ -191,6 +215,7 @@ pub async fn run(
         blockchain_map,
         node_id.clone(),
         SubgraphVersionSwitchingMode::Instant,
+        Arc::new(Settings::default()),
     ));
 
     let (name, hash) = if subgraph.contains(':') {
@@ -223,6 +248,7 @@ pub async fn run(
         subgraph_name.clone(),
         subgraph_hash.clone(),
         node_id.clone(),
+        None,
         None,
         None,
         None,

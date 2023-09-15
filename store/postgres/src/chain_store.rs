@@ -4,6 +4,8 @@ use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::Text;
 use diesel::{insert_into, update};
 use graph::parking_lot::RwLock;
+use graph::prelude::MetricsRegistry;
+use graph::prometheus::{CounterVec, GaugeVec};
 
 use std::{
     collections::HashMap,
@@ -414,6 +416,52 @@ mod data {
             };
             conn.batch_execute(&format!("truncate table {} restart identity", table_name))?;
             Ok(())
+        }
+
+        pub(super) fn cleanup_shallow_blocks(
+            &self,
+            conn: &PgConnection,
+            lowest_block: i32,
+        ) -> Result<(), StoreError> {
+            let table_name = match &self {
+                Storage::Shared => ETHEREUM_BLOCKS_TABLE_NAME,
+                Storage::Private(Schema { blocks, .. }) => &blocks.qname,
+            };
+            conn.batch_execute(&format!(
+                "delete from {} WHERE number >= {} AND data->'block'->'data' = 'null'::jsonb;",
+                table_name, lowest_block,
+            ))?;
+            Ok(())
+        }
+
+        pub(super) fn remove_cursor(
+            &self,
+            conn: &PgConnection,
+            chain: &str,
+        ) -> Result<Option<BlockNumber>, StoreError> {
+            use diesel::dsl::not;
+            use public::ethereum_networks::dsl::*;
+
+            match update(
+                ethereum_networks
+                    .filter(name.eq(chain))
+                    .filter(not(head_block_cursor.is_null())),
+            )
+            .set(head_block_cursor.eq(None as Option<String>))
+            .returning(head_block_number)
+            .get_result::<Option<i64>>(conn)
+            .optional()
+            {
+                Ok(res) => match res {
+                    Some(opt_num) => match opt_num {
+                        Some(num) => Ok(Some(num as i32)),
+                        None => Ok(None),
+                    },
+                    None => Ok(None),
+                },
+                Err(e) => Err(e),
+            }
+            .map_err(Into::into)
         }
 
         /// Insert a block. If the table already contains a block with the
@@ -971,7 +1019,7 @@ mod data {
                     use public::eth_call_meta as meta;
 
                     cache::table
-                        .find(id.as_ref())
+                        .find::<&[u8]>(id.as_ref())
                         .inner_join(meta::table)
                         .select((
                             cache::return_value,
@@ -1099,7 +1147,7 @@ mod data {
                 Storage::Shared => {
                     use public::eth_call_meta as meta;
 
-                    update(meta::table.find(contract_address.as_ref()))
+                    update(meta::table.find::<&[u8]>(contract_address.as_ref()))
                         .set(meta::accessed_at.eq(sql("CURRENT_DATE")))
                         .execute(conn)
                 }
@@ -1322,10 +1370,95 @@ from (
     }
 }
 
+#[derive(Debug)]
+pub struct ChainStoreMetrics {
+    chain_head_cache_size: Box<GaugeVec>,
+    chain_head_cache_oldest_block_num: Box<GaugeVec>,
+    chain_head_cache_latest_block_num: Box<GaugeVec>,
+    chain_head_cache_hits: Box<CounterVec>,
+    chain_head_cache_misses: Box<CounterVec>,
+}
+
+impl ChainStoreMetrics {
+    pub fn new(registry: Arc<MetricsRegistry>) -> Self {
+        let chain_head_cache_size = registry
+            .new_gauge_vec(
+                "chain_head_cache_num_blocks",
+                "Number of blocks in the chain head cache",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the gauge");
+        let chain_head_cache_oldest_block_num = registry
+            .new_gauge_vec(
+                "chain_head_cache_oldest_block",
+                "Block number of the oldest block currently present in the chain head cache",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the gauge");
+        let chain_head_cache_latest_block_num = registry
+            .new_gauge_vec(
+                "chain_head_cache_latest_block",
+                "Block number of the latest block currently present in the chain head cache",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the gauge");
+
+        let chain_head_cache_hits = registry
+            .new_counter_vec(
+                "chain_head_cache_hits",
+                "Number of times the chain head cache was hit",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the counter");
+        let chain_head_cache_misses = registry
+            .new_counter_vec(
+                "chain_head_cache_misses",
+                "Number of times the chain head cache was missed",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the counter");
+
+        Self {
+            chain_head_cache_size,
+            chain_head_cache_oldest_block_num,
+            chain_head_cache_latest_block_num,
+            chain_head_cache_hits,
+            chain_head_cache_misses,
+        }
+    }
+
+    pub fn add_block(&self, network: &str) {
+        self.chain_head_cache_size
+            .with_label_values(&[network])
+            .inc();
+    }
+
+    pub fn remove_block(&self, network: &str) {
+        self.chain_head_cache_size
+            .with_label_values(&[network])
+            .dec();
+    }
+
+    pub fn record_cache_hit(&self, network: &str) {
+        self.chain_head_cache_hits
+            .get_metric_with_label_values(&[network])
+            .unwrap()
+            .inc();
+    }
+
+    pub fn record_cache_miss(&self, network: &str) {
+        self.chain_head_cache_misses
+            .get_metric_with_label_values(&[network])
+            .unwrap()
+            .inc();
+    }
+}
+
 pub struct ChainStore {
     pool: ConnectionPool,
     pub chain: String,
     pub(crate) storage: data::Storage,
+    pub chain_identifier: ChainIdentifier,
     genesis_block_ptr: BlockPtr,
     status: ChainStatus,
     chain_head_update_sender: ChainHeadUpdateSender,
@@ -1347,7 +1480,10 @@ impl ChainStore {
         chain_head_update_sender: ChainHeadUpdateSender,
         pool: ConnectionPool,
         recent_blocks_cache_capacity: usize,
+        metrics: Arc<ChainStoreMetrics>,
     ) -> Self {
+        let recent_blocks_cache =
+            RecentBlocksCache::new(recent_blocks_cache_capacity, chain.clone(), metrics);
         ChainStore {
             pool,
             chain,
@@ -1355,7 +1491,8 @@ impl ChainStore {
             genesis_block_ptr: BlockPtr::new(net_identifier.genesis_block_hash.clone(), 0),
             status,
             chain_head_update_sender,
-            recent_blocks_cache: RecentBlocksCache::new(recent_blocks_cache_capacity),
+            chain_identifier: net_identifier.clone(),
+            recent_blocks_cache,
         }
     }
 
@@ -1460,6 +1597,18 @@ impl ChainStore {
         let conn = self.get_conn()?;
         self.storage
             .delete_blocks_by_hash(&conn, &self.chain, block_hashes)
+    }
+
+    pub fn cleanup_shallow_blocks(&self, lowest_block: i32) -> Result<(), StoreError> {
+        let conn = self.get_conn()?;
+        self.storage.cleanup_shallow_blocks(&conn, lowest_block)?;
+        Ok(())
+    }
+
+    // remove_cursor delete the chain_store cursor and return true if it was present
+    pub fn remove_cursor(&self, chain: &str) -> Result<Option<BlockNumber>, StoreError> {
+        let conn = self.get_conn()?;
+        self.storage.remove_cursor(&conn, chain)
     }
 
     pub fn truncate_block_cache(&self) -> Result<(), StoreError> {
@@ -1832,6 +1981,8 @@ mod recent_blocks_cache {
     }
 
     struct Inner {
+        network: String,
+        metrics: Arc<ChainStoreMetrics>,
         // Note: we only ever store blocks in this cache that have a continuous
         // line of ancestry between each other. Line of ancestry is verified by
         // comparing parent hashes. Because of NEAR, however, we cannot
@@ -1875,6 +2026,26 @@ mod recent_blocks_cache {
             while self.blocks.len() > self.capacity {
                 self.blocks.pop_first();
             }
+        }
+
+        fn update_write_metrics(&self) {
+            self.metrics
+                .chain_head_cache_size
+                .get_metric_with_label_values(&[&self.network])
+                .unwrap()
+                .set(self.blocks.len() as f64);
+
+            self.metrics
+                .chain_head_cache_oldest_block_num
+                .get_metric_with_label_values(&[&self.network])
+                .unwrap()
+                .set(self.earliest_block().map(|b| b.ptr.number).unwrap_or(0) as f64);
+
+            self.metrics
+                .chain_head_cache_latest_block_num
+                .get_metric_with_label_values(&[&self.network])
+                .unwrap()
+                .set(self.chain_head().map(|b| b.number).unwrap_or(0) as f64);
         }
 
         fn insert_block(
@@ -1936,9 +2107,11 @@ mod recent_blocks_cache {
     }
 
     impl RecentBlocksCache {
-        pub fn new(capacity: usize) -> Self {
+        pub fn new(capacity: usize, network: String, metrics: Arc<ChainStoreMetrics>) -> Self {
             RecentBlocksCache {
                 inner: RwLock::new(Inner {
+                    network,
+                    metrics,
                     blocks: BTreeMap::new(),
                     capacity,
                 }),
@@ -1951,7 +2124,8 @@ mod recent_blocks_cache {
         }
 
         pub fn clear(&self) {
-            self.inner.write().blocks.clear()
+            self.inner.write().blocks.clear();
+            self.inner.read().update_write_metrics();
         }
 
         pub fn get_block(
@@ -1959,10 +2133,20 @@ mod recent_blocks_cache {
             child: &BlockPtr,
             offset: BlockNumber,
         ) -> Option<(BlockPtr, Option<json::Value>)> {
-            self.inner
+            let block_opt = self
+                .inner
                 .read()
                 .get_block(child, offset)
-                .map(|b| (b.0.clone(), b.1.cloned()))
+                .map(|b| (b.0.clone(), b.1.cloned()));
+
+            let inner = self.inner.read();
+            if block_opt.is_some() {
+                inner.metrics.record_cache_hit(&inner.network);
+            } else {
+                inner.metrics.record_cache_miss(&inner.network);
+            }
+
+            block_opt
         }
 
         /// Tentatively caches the `ancestor` of a [`BlockPtr`] (`child`), together with
@@ -1975,7 +2159,8 @@ mod recent_blocks_cache {
             data: Option<json::Value>,
             parent_hash: BlockHash,
         ) {
-            self.inner.write().insert_block(ptr, data, parent_hash)
+            self.inner.write().insert_block(ptr, data, parent_hash);
+            self.inner.read().update_write_metrics();
         }
     }
 }

@@ -1,11 +1,14 @@
+use crate::block_ingestor::SubstreamsBlockIngestor;
 use crate::{data_source::*, EntityChanges, TriggerData, TriggerFilter, TriggersAdapter};
 use anyhow::Error;
 use graph::blockchain::client::ChainClient;
-use graph::blockchain::{BlockIngestor, EmptyNodeCapabilities, NoopRuntimeAdapter};
-use graph::components::metrics::MetricsRegistryTrait;
+use graph::blockchain::{
+    BasicBlockchainBuilder, BlockIngestor, BlockchainBuilder, EmptyNodeCapabilities,
+    NoopRuntimeAdapter,
+};
 use graph::components::store::DeploymentCursorTracker;
 use graph::firehose::FirehoseEndpoints;
-use graph::prelude::{BlockHash, LoggerFactory};
+use graph::prelude::{BlockHash, CheapClone, LoggerFactory, MetricsRegistry};
 use graph::{
     blockchain::{
         self,
@@ -45,14 +48,14 @@ pub struct Chain {
 
     pub(crate) logger_factory: LoggerFactory,
     pub(crate) client: Arc<ChainClient<Self>>,
-    pub(crate) metrics_registry: Arc<dyn MetricsRegistryTrait>,
+    pub(crate) metrics_registry: Arc<MetricsRegistry>,
 }
 
 impl Chain {
     pub fn new(
         logger_factory: LoggerFactory,
         firehose_endpoints: FirehoseEndpoints,
-        metrics_registry: Arc<dyn MetricsRegistryTrait>,
+        metrics_registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
         block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
     ) -> Self {
@@ -164,6 +167,32 @@ impl Blockchain for Chain {
     }
 
     fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
-        unreachable!("Substreams rely on the block ingestor from the network they are processing")
+        Ok(Box::new(SubstreamsBlockIngestor::new(
+            self.chain_store.cheap_clone(),
+            self.client.cheap_clone(),
+            self.logger_factory.component_logger("", None),
+            "substreams".to_string(),
+            self.metrics_registry.cheap_clone(),
+        )))
+    }
+}
+
+impl BlockchainBuilder<super::Chain> for BasicBlockchainBuilder {
+    fn build(self) -> super::Chain {
+        let BasicBlockchainBuilder {
+            logger_factory,
+            name: _,
+            chain_store,
+            firehose_endpoints,
+            metrics_registry,
+        } = self;
+
+        Chain {
+            chain_store,
+            block_stream_builder: Arc::new(crate::BlockStreamBuilder::new()),
+            logger_factory,
+            client: Arc::new(ChainClient::new_firehose(firehose_endpoints)),
+            metrics_registry,
+        }
     }
 }

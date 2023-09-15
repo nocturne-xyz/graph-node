@@ -6,8 +6,7 @@ pub(crate) use private::DataSourcesTable;
 use crate::primary::Site;
 use diesel::PgConnection;
 use graph::{
-    blockchain::BlockPtr,
-    components::store::StoredDynamicDataSource,
+    components::store::{write, StoredDynamicDataSource},
     constraint_violation,
     data_source::CausalityRegion,
     prelude::{BlockNumber, StoreError},
@@ -28,33 +27,22 @@ pub fn load(
 pub(crate) fn insert(
     conn: &PgConnection,
     site: &Site,
-    data_sources: &[StoredDynamicDataSource],
-    block_ptr: &BlockPtr,
+    data_sources: &write::DataSources,
     manifest_idx_and_name: &[(u32, String)],
 ) -> Result<usize, StoreError> {
     match site.schema_version.private_data_sources() {
-        true => DataSourcesTable::new(site.namespace.clone()).insert(
-            conn,
-            data_sources,
-            block_ptr.number,
-        ),
-        false => shared::insert(
-            conn,
-            &site.deployment,
-            data_sources,
-            block_ptr,
-            manifest_idx_and_name,
-        ),
+        true => DataSourcesTable::new(site.namespace.clone()).insert(conn, data_sources),
+        false => shared::insert(conn, &site.deployment, data_sources, manifest_idx_and_name),
     }
 }
 
-pub(crate) fn revert(
+pub(crate) fn revert_to(
     conn: &PgConnection,
     site: &Site,
     block: BlockNumber,
 ) -> Result<(), StoreError> {
     match site.schema_version.private_data_sources() {
-        true => DataSourcesTable::new(site.namespace.clone()).revert(conn, block),
+        true => DataSourcesTable::new(site.namespace.clone()).revert_to(conn, block),
         false => shared::revert(conn, &site.deployment, block),
     }
 }
@@ -62,7 +50,7 @@ pub(crate) fn revert(
 pub(crate) fn update_offchain_status(
     conn: &PgConnection,
     site: &Site,
-    data_sources: &[StoredDynamicDataSource],
+    data_sources: &write::DataSources,
 ) -> Result<(), StoreError> {
     if data_sources.is_empty() {
         return Ok(());

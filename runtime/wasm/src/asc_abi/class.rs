@@ -4,7 +4,8 @@ use semver::Version;
 use graph::{
     data::store,
     runtime::{
-        gas::GasCounter, AscHeap, AscIndexId, AscType, AscValue, IndexForAscTypeId, ToAscObj,
+        gas::GasCounter, AscHeap, AscIndexId, AscType, AscValue, HostExportError,
+        IndexForAscTypeId, ToAscObj,
     },
 };
 use graph::{prelude::serde_json, runtime::DeterministicHostError};
@@ -92,7 +93,7 @@ impl<T: AscValue> TypedArray<T> {
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<Self, DeterministicHostError> {
+    ) -> Result<Self, HostExportError> {
         match heap.api_version() {
             version if version <= Version::new(0, 0, 4) => Ok(Self::ApiVersion0_0_4(
                 v0_0_4::TypedArray::new(content, heap, gas)?,
@@ -147,7 +148,7 @@ impl ToAscObj<Uint8Array> for Bytes<'_> {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<Uint8Array, DeterministicHostError> {
+    ) -> Result<Uint8Array, HostExportError> {
         self.0.to_asc_obj(heap, gas)
     }
 }
@@ -272,7 +273,7 @@ impl<T: AscValue> Array<T> {
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<Self, DeterministicHostError> {
+    ) -> Result<Self, HostExportError> {
         match heap.api_version() {
             version if version <= Version::new(0, 0, 4) => Ok(Self::ApiVersion0_0_4(
                 v0_0_4::Array::new(content, heap, gas)?,
@@ -427,6 +428,12 @@ impl From<EnumPayload> for f64 {
     }
 }
 
+impl From<EnumPayload> for i64 {
+    fn from(payload: EnumPayload) -> i64 {
+        payload.0 as i64
+    }
+}
+
 impl From<EnumPayload> for bool {
     fn from(payload: EnumPayload) -> bool {
         payload.0 != 0
@@ -545,6 +552,7 @@ pub enum StoreValueKind {
     Null,
     Bytes,
     BigInt,
+    Int8,
 }
 
 impl StoreValueKind {
@@ -554,6 +562,7 @@ impl StoreValueKind {
         match value {
             Value::String(_) => StoreValueKind::String,
             Value::Int(_) => StoreValueKind::Int,
+            Value::Int8(_) => StoreValueKind::Int8,
             Value::BigDecimal(_) => StoreValueKind::BigDecimal,
             Value::Bool(_) => StoreValueKind::Bool,
             Value::List(_) => StoreValueKind::Array,
@@ -606,6 +615,10 @@ pub struct AscTypedMap<K, V> {
 
 impl AscIndexId for AscTypedMap<AscString, AscEnum<StoreValueKind>> {
     const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::TypedMapStringStoreValue;
+}
+
+impl AscIndexId for Array<AscPtr<AscEntity>> {
+    const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::ArrayTypedMapStringStoreValue;
 }
 
 impl AscIndexId for AscTypedMap<AscString, AscEnum<JsonValueKind>> {

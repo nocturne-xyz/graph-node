@@ -1,6 +1,6 @@
-use crate::schema;
 use graph::prelude::s::{EnumType, InputValue, ScalarType, Type, TypeDefinition};
 use graph::prelude::{q, r, QueryExecutionError};
+use graph::schema;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
@@ -41,6 +41,10 @@ impl MaybeCoercible<ScalarType> for q::Value {
                 } else {
                     Err(q::Value::Int(num))
                 }
+            }
+            ("Int8", q::Value::Int(num)) => {
+                let n = num.as_i64().ok_or_else(|| q::Value::Int(num.clone()))?;
+                Ok(r::Value::Int(n))
             }
             ("String", q::Value::String(s)) => Ok(r::Value::String(s)),
             ("ID", q::Value::String(s)) => Ok(r::Value::String(s)),
@@ -385,6 +389,21 @@ mod tests {
         );
 
         // And also from Value::Int
+        assert_eq!(
+            coerce_to_definition(Value::Int(1234.into()), "", &resolver),
+            Ok(Value::String("1234".to_string()))
+        );
+        assert_eq!(
+            coerce_to_definition(Value::Int((-1234_i32).into()), "", &resolver,),
+            Ok(Value::String("-1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn coerce_int8_scalar() {
+        let int8_type = TypeDefinition::Scalar(ScalarType::new("Int8".to_string()));
+        let resolver = |_: &str| Some(&int8_type);
+
         assert_eq!(
             coerce_to_definition(Value::Int(1234.into()), "", &resolver),
             Ok(Value::String("1234".to_string()))

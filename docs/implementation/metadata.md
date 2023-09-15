@@ -106,6 +106,7 @@ shard alongside the deployment's data in `sgdNNN`.
 | `start_block_hash`      | `bytea`    | Parent of the smallest start block from the manifest |
 | `start_block_number`    | `int4`     |                                                      |
 | `on_sync`               | `text`     | Additional behavior when deployment becomes synced   |
+| `history_blocks`        | `int4!`    | How many blocks of history to keep                   |
 
 ### `subgraph_deployment_assignment`
 
@@ -140,3 +141,16 @@ correctly across index node restarts.
 
 The table `subgraphs.table_stats` stores which tables for a deployment
 should have the 'account-like' optimization turned on.
+
+### `subgraphs.subgraph_features`
+
+Details about features that a deployment uses, Maintained in the primary.
+
+| Column         | Type      | Use         |
+|----------------|-----------|-------------|
+| `id`           | `text!`   | primary key |
+| `spec_version` | `text!`   |             |
+| `api_version`  | `text`    |             |
+| `features`     | `text[]!` |             |
+| `data_sources` | `text[]!` |             |
+| `handlers`     | `text[]!` |             |

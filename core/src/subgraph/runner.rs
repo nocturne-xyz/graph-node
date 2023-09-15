@@ -6,12 +6,13 @@ use crate::subgraph::stream::new_block_stream;
 use atomic_refcell::AtomicRefCell;
 use graph::blockchain::block_stream::{BlockStreamEvent, BlockWithTriggers, FirehoseCursor};
 use graph::blockchain::{Block, Blockchain, DataSource as _, TriggerFilter as _};
-use graph::components::store::{EmptyStore, EntityKey, StoredDynamicDataSource};
+use graph::components::store::{EmptyStore, EntityKey, GetScope, StoredDynamicDataSource};
 use graph::components::{
     store::ModificationsAndCache,
     subgraph::{MappingError, PoICausalityRegion, ProofOfIndexing, SharedProofOfIndexing},
 };
 use graph::data::store::scalar::Bytes;
+use graph::data::subgraph::schema::POI_DIGEST;
 use graph::data::subgraph::{
     schema::{SubgraphError, SubgraphHealth, POI_OBJECT},
     SubgraphFeature,
@@ -28,6 +29,10 @@ use std::time::{Duration, Instant};
 const MINUTE: Duration = Duration::from_secs(60);
 
 const SKIP_PTR_UPDATES_THRESHOLD: Duration = Duration::from_secs(60 * 5);
+const HANDLE_REVERT_SECTION_NAME: &str = "handle_revert";
+const PROCESS_BLOCK_SECTION_NAME: &str = "process_block";
+const PROCESS_TRIGGERS_SECTION_NAME: &str = "process_triggers";
+const HANDLE_CREATED_DS_SECTION_NAME: &str = "handle_new_data_sources";
 
 pub struct SubgraphRunner<C, T>
 where
@@ -60,9 +65,10 @@ where
                 should_try_unfail_non_deterministic: true,
                 synced: false,
                 skip_ptr_updates_timer: Instant::now(),
-                backoff: ExponentialBackoff::new(
+                backoff: ExponentialBackoff::with_jitter(
                     (MINUTE * 2).min(env_vars.subgraph_error_retry_ceil),
                     env_vars.subgraph_error_retry_ceil,
+                    env_vars.subgraph_error_retry_jitter,
                 ),
                 entity_lfu_cache: LfuCache::new(),
             },
@@ -100,8 +106,8 @@ where
         self.run_inner(break_on_restart).await
     }
 
-    pub async fn run(self) -> Result<Self, Error> {
-        self.run_inner(false).await
+    pub async fn run(self) -> Result<(), Error> {
+        self.run_inner(false).await.map(|_| ())
     }
 
     async fn run_inner(mut self, break_on_restart: bool) -> Result<Self, Error> {
@@ -121,6 +127,10 @@ where
                 // There's no point in calling it if we have no current or parent block
                 // pointers, because there would be: no block to revert to or to search
                 // errors from (first execution).
+                //
+                // We attempt to unfail deterministic errors to mitigate deterministic
+                // errors caused by wrong data being consumed from the providers. It has
+                // been a frequent case in the past so this helps recover on a larger scale.
                 let _outcome = self
                     .inputs
                     .store
@@ -174,7 +184,19 @@ where
                         self.inputs.store.flush().await?;
                         return Ok(self);
                     }
-                    Action::Restart => break,
+                    Action::Restart => {
+                        // Restart the store to clear any errors that it
+                        // might have encountered and use that from now on
+                        let store = self.inputs.store.cheap_clone();
+                        if let Some(store) = store.restart().await? {
+                            let last_good_block =
+                                store.block_ptr().map(|ptr| ptr.number).unwrap_or(0);
+                            self.revert_state(last_good_block)?;
+                            self.inputs = Arc::new(self.inputs.with_store(store));
+                            self.state.synced = self.inputs.store.is_deployment_synced().await?;
+                        }
+                        break;
+                    }
                 };
             }
         }
@@ -197,15 +219,8 @@ where
                 "block_hash" => format!("{}", block_ptr.hash)
         ));
 
-        if triggers.len() == 1 {
-            debug!(&logger, "1 candidate trigger in this block");
-        } else {
-            debug!(
-                &logger,
-                "{} candidate triggers in this block",
-                triggers.len()
-            );
-        }
+        debug!(logger, "Start processing block";
+               "triggers" => triggers.len());
 
         let proof_of_indexing = if self.inputs.store.supports_proof_of_indexing().await? {
             Some(Arc::new(AtomicRefCell::new(ProofOfIndexing::new(
@@ -219,126 +234,155 @@ where
         // Causality region for onchain triggers.
         let causality_region = PoICausalityRegion::from_network(&self.inputs.network);
 
-        // Process events one after the other, passing in entity operations
-        // collected previously to every new event being processed
-        let mut block_state = match self
-            .process_triggers(
-                &proof_of_indexing,
-                &block,
-                triggers.into_iter().map(TriggerData::Onchain),
-                &causality_region,
-            )
-            .await
-        {
-            // Triggers processed with no errors or with only deterministic errors.
-            Ok(block_state) => block_state,
+        let mut block_state = {
+            let _section = self
+                .metrics
+                .stream
+                .stopwatch
+                .start_section(PROCESS_TRIGGERS_SECTION_NAME);
 
-            // Some form of unknown or non-deterministic error ocurred.
-            Err(MappingError::Unknown(e)) => return Err(BlockProcessingError::Unknown(e)),
-            Err(MappingError::PossibleReorg(e)) => {
-                info!(logger,
-                    "Possible reorg detected, retrying";
-                    "error" => format!("{:#}", e),
-                );
+            // Process events one after the other, passing in entity operations
+            // collected previously to every new event being processed
+            match self
+                .process_triggers(
+                    &proof_of_indexing,
+                    &block,
+                    triggers.into_iter().map(TriggerData::Onchain),
+                    &causality_region,
+                )
+                .await
+            {
+                // Triggers processed with no errors or with only deterministic errors.
+                Ok(block_state) => block_state,
 
-                // In case of a possible reorg, we want this function to do nothing and restart the
-                // block stream so it has a chance to detect the reorg.
-                //
-                // The state is unchanged at this point, except for having cleared the entity cache.
-                // Losing the cache is a bit annoying but not an issue for correctness.
-                //
-                // See also b21fa73b-6453-4340-99fb-1a78ec62efb1.
-                return Ok(Action::Restart);
+                // Some form of unknown or non-deterministic error ocurred.
+                Err(MappingError::Unknown(e)) => return Err(BlockProcessingError::Unknown(e)),
+                Err(MappingError::PossibleReorg(e)) => {
+                    info!(logger,
+                        "Possible reorg detected, retrying";
+                        "error" => format!("{:#}", e),
+                    );
+
+                    // In case of a possible reorg, we want this function to do nothing and restart the
+                    // block stream so it has a chance to detect the reorg.
+                    //
+                    // The state is unchanged at this point, except for having cleared the entity cache.
+                    // Losing the cache is a bit annoying but not an issue for correctness.
+                    //
+                    // See also b21fa73b-6453-4340-99fb-1a78ec62efb1.
+                    return Ok(Action::Restart);
+                }
             }
         };
 
-        // If new data sources have been created, and static filters are not in use, it is necessary
+        // If new onchain data sources have been created, and static filters are not in use, it is necessary
         // to restart the block stream with the new filters.
-        let needs_restart = block_state.has_created_data_sources() && !self.inputs.static_filters;
+        let needs_restart =
+            block_state.has_created_on_chain_data_sources() && !self.inputs.static_filters;
 
-        // This loop will:
-        // 1. Instantiate created data sources.
-        // 2. Process those data sources for the current block.
-        // Until no data sources are created or MAX_DATA_SOURCES is hit.
+        {
+            let _section = self
+                .metrics
+                .stream
+                .stopwatch
+                .start_section(HANDLE_CREATED_DS_SECTION_NAME);
 
-        // Note that this algorithm processes data sources spawned on the same block _breadth
-        // first_ on the tree implied by the parent-child relationship between data sources. Only a
-        // very contrived subgraph would be able to observe this.
-        while block_state.has_created_data_sources() {
-            // Instantiate dynamic data sources, removing them from the block state.
-            let (data_sources, runtime_hosts) =
-                self.create_dynamic_data_sources(block_state.drain_created_data_sources())?;
+            // This loop will:
+            // 1. Instantiate created data sources.
+            // 2. Process those data sources for the current block.
+            // Until no data sources are created or MAX_DATA_SOURCES is hit.
 
-            let filter = C::TriggerFilter::from_data_sources(
-                data_sources.iter().filter_map(DataSource::as_onchain),
-            );
+            // Note that this algorithm processes data sources spawned on the same block _breadth
+            // first_ on the tree implied by the parent-child relationship between data sources. Only a
+            // very contrived subgraph would be able to observe this.
+            while block_state.has_created_data_sources() {
+                // Instantiate dynamic data sources, removing them from the block state.
+                let (data_sources, runtime_hosts) =
+                    self.create_dynamic_data_sources(block_state.drain_created_data_sources())?;
 
-            let block: Arc<C::Block> = if self.inputs.chain.is_refetch_block_required() {
-                Arc::new(
-                    self.inputs
-                        .chain
-                        .refetch_firehose_block(&logger, firehose_cursor.clone())
+                let filter = C::TriggerFilter::from_data_sources(
+                    data_sources.iter().filter_map(DataSource::as_onchain),
+                );
+
+                let block: Arc<C::Block> = if self.inputs.chain.is_refetch_block_required() {
+                    let cur = firehose_cursor.clone();
+                    let log = logger.cheap_clone();
+                    let chain = self.inputs.chain.cheap_clone();
+                    Arc::new(
+                        retry(
+                            "refetch firehose block after dynamic datasource was added",
+                            &logger,
+                        )
+                        .limit(5)
+                        .no_timeout()
+                        .run(move || {
+                            let cur = cur.clone();
+                            let log = log.cheap_clone();
+                            let chain = chain.cheap_clone();
+                            async move { chain.refetch_firehose_block(&log, cur).await }
+                        })
                         .await?,
-                )
-            } else {
-                block.cheap_clone()
-            };
-
-            // Reprocess the triggers from this block that match the new data sources
-            let block_with_triggers = self
-                .inputs
-                .triggers_adapter
-                .triggers_in_block(&logger, block.as_ref().clone(), &filter)
-                .await?;
-
-            let triggers = block_with_triggers.trigger_data;
-
-            if triggers.len() == 1 {
-                info!(
-                    &logger,
-                    "1 trigger found in this block for the new data sources"
-                );
-            } else if triggers.len() > 1 {
-                info!(
-                    &logger,
-                    "{} triggers found in this block for the new data sources",
-                    triggers.len()
-                );
-            }
-
-            // Add entity operations for the new data sources to the block state
-            // and add runtimes for the data sources to the subgraph instance.
-            self.persist_dynamic_data_sources(&mut block_state, data_sources);
-
-            // Process the triggers in each host in the same order the
-            // corresponding data sources have been created.
-            for trigger in triggers {
-                block_state = self
-                    .ctx
-                    .process_trigger_in_hosts(
-                        &logger,
-                        &runtime_hosts,
-                        &block,
-                        &TriggerData::Onchain(trigger),
-                        block_state,
-                        &proof_of_indexing,
-                        &causality_region,
-                        &self.inputs.debug_fork,
-                        &self.metrics.subgraph,
-                        self.inputs.instrument,
                     )
-                    .await
-                    .map_err(|e| {
-                        // This treats a `PossibleReorg` as an ordinary error which will fail the subgraph.
-                        // This can cause an unnecessary subgraph failure, to fix it we need to figure out a
-                        // way to revert the effect of `create_dynamic_data_sources` so we may return a
-                        // clean context as in b21fa73b-6453-4340-99fb-1a78ec62efb1.
-                        match e {
-                            MappingError::PossibleReorg(e) | MappingError::Unknown(e) => {
-                                BlockProcessingError::Unknown(e)
+                } else {
+                    block.cheap_clone()
+                };
+
+                // Reprocess the triggers from this block that match the new data sources
+                let block_with_triggers = self
+                    .inputs
+                    .triggers_adapter
+                    .triggers_in_block(&logger, block.as_ref().clone(), &filter)
+                    .await?;
+
+                let triggers = block_with_triggers.trigger_data;
+
+                if triggers.len() == 1 {
+                    info!(
+                        &logger,
+                        "1 trigger found in this block for the new data sources"
+                    );
+                } else if triggers.len() > 1 {
+                    info!(
+                        &logger,
+                        "{} triggers found in this block for the new data sources",
+                        triggers.len()
+                    );
+                }
+
+                // Add entity operations for the new data sources to the block state
+                // and add runtimes for the data sources to the subgraph instance.
+                self.persist_dynamic_data_sources(&mut block_state, data_sources);
+
+                // Process the triggers in each host in the same order the
+                // corresponding data sources have been created.
+                for trigger in triggers {
+                    block_state = self
+                        .ctx
+                        .process_trigger_in_hosts(
+                            &logger,
+                            Box::new(runtime_hosts.iter().map(|host| host.as_ref())),
+                            &block,
+                            &TriggerData::Onchain(trigger),
+                            block_state,
+                            &proof_of_indexing,
+                            &causality_region,
+                            &self.inputs.debug_fork,
+                            &self.metrics.subgraph,
+                            self.inputs.instrument,
+                        )
+                        .await
+                        .map_err(|e| {
+                            // This treats a `PossibleReorg` as an ordinary error which will fail the subgraph.
+                            // This can cause an unnecessary subgraph failure, to fix it we need to figure out a
+                            // way to revert the effect of `create_dynamic_data_sources` so we may return a
+                            // clean context as in b21fa73b-6453-4340-99fb-1a78ec62efb1.
+                            match e {
+                                MappingError::PossibleReorg(e) | MappingError::Unknown(e) => {
+                                    BlockProcessingError::Unknown(e)
+                                }
                             }
-                        }
-                    })?;
+                        })?;
+                }
             }
         }
 
@@ -373,16 +417,27 @@ where
         let ModificationsAndCache {
             modifications: mut mods,
             entity_lfu_cache: cache,
+            evict_stats,
         } = block_state
             .entity_cache
-            .as_modifications()
+            .as_modifications(block.number())
             .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
         section.end();
+
+        debug!(self.logger, "Entity cache statistics";
+            "weight" => evict_stats.new_weight,
+            "evicted_weight" => evict_stats.evicted_weight,
+            "count" => evict_stats.new_count,
+            "evicted_count" => evict_stats.evicted_count,
+            "stale_update" => evict_stats.stale_update,
+            "hit_rate" => format!("{:.0}%", evict_stats.hit_rate_pct()),
+            "accesses" => evict_stats.accesses,
+            "evict_time_ms" => evict_stats.evict_time.as_millis());
 
         // Check for offchain events and process them, including their entity modifications in the
         // set to be transacted.
         let offchain_events = self.ctx.offchain_monitor.ready_offchain_events()?;
-        let (offchain_mods, processed_data_sources) = self
+        let (offchain_mods, processed_data_sources, persisted_off_chain_data_sources) = self
             .handle_offchain_triggers(offchain_events, &block)
             .await?;
         mods.extend(offchain_mods);
@@ -414,7 +469,7 @@ where
         // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
         if has_errors && !is_non_fatal_errors_active {
             let is_poi_entity =
-                |entity_mod: &EntityModification| entity_mod.entity_ref().entity_type.is_poi();
+                |entity_mod: &EntityModification| entity_mod.key().entity_type.is_poi();
             mods.retain(is_poi_entity);
             // Confidence check
             assert!(
@@ -425,12 +480,13 @@ where
 
         let BlockState {
             deterministic_errors,
-            persisted_data_sources,
+            mut persisted_data_sources,
             ..
         } = block_state;
 
         let first_error = deterministic_errors.first().cloned();
 
+        persisted_data_sources.extend(persisted_off_chain_data_sources);
         store
             .transact_block_operations(
                 block_ptr,
@@ -439,8 +495,8 @@ where
                 &self.metrics.host.stopwatch,
                 persisted_data_sources,
                 deterministic_errors,
-                self.inputs.manifest_idx_and_name.clone(),
                 processed_data_sources,
+                is_non_fatal_errors_active,
             )
             .await
             .context("Failed to transact block operations")?;
@@ -621,10 +677,20 @@ where
     ) -> Result<Action, Error> {
         let action = match event {
             Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => {
+                let _section = self
+                    .metrics
+                    .stream
+                    .stopwatch
+                    .start_section(PROCESS_BLOCK_SECTION_NAME);
                 self.handle_process_block(block, cursor, cancel_handle)
                     .await?
             }
             Some(Ok(BlockStreamEvent::Revert(revert_to_ptr, cursor))) => {
+                let _section = self
+                    .metrics
+                    .stream
+                    .stopwatch
+                    .start_section(HANDLE_REVERT_SECTION_NAME);
                 self.handle_revert(revert_to_ptr, cursor).await?
             }
             // Log and drop the errors from the block_stream
@@ -642,9 +708,17 @@ where
         &mut self,
         triggers: Vec<offchain::TriggerData>,
         block: &Arc<C::Block>,
-    ) -> Result<(Vec<EntityModification>, Vec<StoredDynamicDataSource>), Error> {
+    ) -> Result<
+        (
+            Vec<EntityModification>,
+            Vec<StoredDynamicDataSource>,
+            Vec<StoredDynamicDataSource>,
+        ),
+        Error,
+    > {
         let mut mods = vec![];
         let mut processed_data_sources = vec![];
+        let mut persisted_data_sources = vec![];
 
         for trigger in triggers {
             // Using an `EmptyStore` and clearing the cache for each trigger is a makeshift way to
@@ -681,9 +755,16 @@ where
                 })?;
 
             anyhow::ensure!(
-                !block_state.has_created_data_sources(),
-                "Attempted to create data source in offchain data source handler. This is not yet supported.",
+                !block_state.has_created_on_chain_data_sources(),
+                "Attempted to create on-chain data source in offchain data source handler. This is not yet supported.",
             );
+
+            let (data_sources, _) =
+                self.create_dynamic_data_sources(block_state.drain_created_data_sources())?;
+
+            // Add entity operations for the new data sources to the block state
+            // and add runtimes for the data sources to the subgraph instance.
+            self.persist_dynamic_data_sources(&mut block_state, data_sources);
 
             // This propagates any deterministic error as a non-deterministic one. Which might make
             // sense considering offchain data sources are non-deterministic.
@@ -691,11 +772,17 @@ where
                 return Err(anyhow!("{}", err.to_string()));
             }
 
-            mods.extend(block_state.entity_cache.as_modifications()?.modifications);
+            mods.extend(
+                block_state
+                    .entity_cache
+                    .as_modifications(block.number())?
+                    .modifications,
+            );
             processed_data_sources.extend(block_state.processed_data_sources);
+            persisted_data_sources.extend(block_state.persisted_data_sources)
         }
 
-        Ok((mods, processed_data_sources))
+        Ok((mods, processed_data_sources, persisted_data_sources))
     }
 }
 
@@ -984,6 +1071,23 @@ async fn update_proof_of_indexing(
     stopwatch: &StopwatchMetrics,
     entity_cache: &mut EntityCache,
 ) -> Result<(), Error> {
+    // Helper to store the digest as a PoI entity in the cache
+    fn store_poi_entity(
+        entity_cache: &mut EntityCache,
+        key: EntityKey,
+        digest: Bytes,
+    ) -> Result<(), Error> {
+        let data = vec![
+            (
+                graph::data::store::ID.clone(),
+                Value::from(key.entity_id.to_string()),
+            ),
+            (POI_DIGEST.clone(), Value::from(digest)),
+        ];
+        let poi = entity_cache.make_entity(data)?;
+        entity_cache.set(key, poi)
+    }
+
     let _section_guard = stopwatch.start_section("update_proof_of_indexing");
 
     let mut proof_of_indexing = proof_of_indexing.take();
@@ -1003,14 +1107,13 @@ async fn update_proof_of_indexing(
         };
 
         // Grab the current digest attribute on this entity
-        let prev_poi =
-            entity_cache
-                .get(&entity_key)
-                .map_err(Error::from)?
-                .map(|entity| match entity.get("digest") {
-                    Some(Value::Bytes(b)) => b.clone(),
-                    _ => panic!("Expected POI entity to have a digest and for it to be bytes"),
-                });
+        let prev_poi = entity_cache
+            .get(&entity_key, GetScope::Store)
+            .map_err(Error::from)?
+            .map(|entity| match entity.get(POI_DIGEST.as_str()) {
+                Some(Value::Bytes(b)) => b.clone(),
+                _ => panic!("Expected POI entity to have a digest and for it to be bytes"),
+            });
 
         // Finish the POI stream, getting the new POI value.
         let updated_proof_of_indexing = stream.pause(prev_poi.as_deref());
@@ -1018,12 +1121,7 @@ async fn update_proof_of_indexing(
 
         // Put this onto an entity with the same digest attribute
         // that was expected before when reading.
-        let new_poi_entity = entity! {
-            id: entity_key.entity_id.to_string(),
-            digest: updated_proof_of_indexing,
-        };
-
-        entity_cache.set(entity_key, new_poi_entity)?;
+        store_poi_entity(entity_cache, entity_key, updated_proof_of_indexing)?;
     }
 
     Ok(())

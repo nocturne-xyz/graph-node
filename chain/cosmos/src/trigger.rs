@@ -1,9 +1,10 @@
 use std::{cmp::Ordering, sync::Arc};
 
-use graph::blockchain::{Block, BlockHash, TriggerData};
+use graph::blockchain::{Block, BlockHash, MappingTriggerTrait, TriggerData};
 use graph::cheap_clone::CheapClone;
 use graph::prelude::{BlockNumber, Error};
-use graph::runtime::{asc_new, gas::GasCounter, AscHeap, AscPtr, DeterministicHostError};
+use graph::runtime::HostExportError;
+use graph::runtime::{asc_new, gas::GasCounter, AscHeap, AscPtr};
 use graph_runtime_wasm::module::ToAscPtr;
 
 use crate::codec;
@@ -42,7 +43,7 @@ impl ToAscPtr for CosmosTrigger {
         self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscPtr<()>, DeterministicHostError> {
+    ) -> Result<AscPtr<()>, HostExportError> {
         Ok(match self {
             CosmosTrigger::Block(block) => asc_new(heap, block.as_ref(), gas)?.erase(),
             CosmosTrigger::Event { event_data, .. } => {
@@ -160,52 +161,7 @@ impl CosmosTrigger {
             CosmosTrigger::Message(message_data) => message_data.block().map(|b| b.hash()),
         }
     }
-}
 
-impl Ord for CosmosTrigger {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            // Events have no intrinsic ordering information, so we keep the order in
-            // which they are included in the `events` field
-            (Self::Event { .. }, Self::Event { .. }) => Ordering::Equal,
-
-            // Keep the order when comparing two message triggers
-            (Self::Message(..), Self::Message(..)) => Ordering::Equal,
-
-            // Transactions are ordered by their index inside the block
-            (Self::Transaction(a), Self::Transaction(b)) => {
-                if let (Ok(a_tx_result), Ok(b_tx_result)) = (a.tx_result(), b.tx_result()) {
-                    a_tx_result.index.cmp(&b_tx_result.index)
-                } else {
-                    Ordering::Equal
-                }
-            }
-
-            // Keep the order when comparing two block triggers
-            (Self::Block(..), Self::Block(..)) => Ordering::Equal,
-
-            // Event triggers always come first
-            (Self::Event { .. }, _) => Ordering::Greater,
-            (_, Self::Event { .. }) => Ordering::Less,
-
-            // Block triggers always come last
-            (Self::Block(..), _) => Ordering::Less,
-            (_, Self::Block(..)) => Ordering::Greater,
-
-            // Message triggers before Transaction triggers
-            (Self::Message(..), Self::Transaction(..)) => Ordering::Greater,
-            (Self::Transaction(..), Self::Message(..)) => Ordering::Less,
-        }
-    }
-}
-
-impl PartialOrd for CosmosTrigger {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl TriggerData for CosmosTrigger {
     fn error_context(&self) -> std::string::String {
         match self {
             CosmosTrigger::Block(..) => {
@@ -260,6 +216,64 @@ impl TriggerData for CosmosTrigger {
     }
 }
 
+impl Ord for CosmosTrigger {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            // Events have no intrinsic ordering information, so we keep the order in
+            // which they are included in the `events` field
+            (Self::Event { .. }, Self::Event { .. }) => Ordering::Equal,
+
+            // Keep the order when comparing two message triggers
+            (Self::Message(..), Self::Message(..)) => Ordering::Equal,
+
+            // Transactions are ordered by their index inside the block
+            (Self::Transaction(a), Self::Transaction(b)) => {
+                if let (Ok(a_tx_result), Ok(b_tx_result)) = (a.tx_result(), b.tx_result()) {
+                    a_tx_result.index.cmp(&b_tx_result.index)
+                } else {
+                    Ordering::Equal
+                }
+            }
+
+            // Keep the order when comparing two block triggers
+            (Self::Block(..), Self::Block(..)) => Ordering::Equal,
+
+            // Event triggers always come first
+            (Self::Event { .. }, _) => Ordering::Greater,
+            (_, Self::Event { .. }) => Ordering::Less,
+
+            // Block triggers always come last
+            (Self::Block(..), _) => Ordering::Less,
+            (_, Self::Block(..)) => Ordering::Greater,
+
+            // Message triggers before Transaction triggers
+            (Self::Message(..), Self::Transaction(..)) => Ordering::Greater,
+            (Self::Transaction(..), Self::Message(..)) => Ordering::Less,
+        }
+    }
+}
+
+impl PartialOrd for CosmosTrigger {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl TriggerData for CosmosTrigger {
+    fn error_context(&self) -> String {
+        self.error_context()
+    }
+
+    fn address_match(&self) -> Option<&[u8]> {
+        None
+    }
+}
+
+impl MappingTriggerTrait for CosmosTrigger {
+    fn error_context(&self) -> String {
+        self.error_context()
+    }
+}
 #[cfg(test)]
 mod tests {
     use crate::codec::TxResult;

@@ -14,14 +14,14 @@ use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, SubgraphLimit};
 use graph::prelude::ethabi::ethereum_types::H256;
 use graph::prelude::web3::types::{Address, Log, Transaction, H160};
 use graph::prelude::{
-    ethabi, tiny_keccak, LightEthereumBlock, LoggerFactory, MetricsRegistry, NodeId,
+    ethabi, tiny_keccak, LightEthereumBlock, LoggerFactory, MetricsRegistry, NodeId, ENV_VARS,
 };
 use graph::{blockchain::block_stream::BlockWithTriggers, prelude::ethabi::ethereum_types::U64};
+use graph_chain_ethereum::Chain;
 use graph_chain_ethereum::{
     chain::BlockFinality,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
 };
-use graph_chain_ethereum::{Chain, ENV_VARS};
 
 pub async fn chain(
     blocks: Vec<BlockWithTriggers<Chain>>,
@@ -71,7 +71,7 @@ pub async fn chain(
         triggers_adapter,
         Arc::new(NoopRuntimeAdapter { x: PhantomData }),
         ENV_VARS.reorg_threshold,
-        ENV_VARS.ingestor_polling_interval,
+        graph_chain_ethereum::ENV_VARS.ingestor_polling_interval,
         // We assume the tested chain is always ingestible for now
         true,
     );
@@ -90,8 +90,23 @@ pub fn genesis() -> BlockWithTriggers<graph_chain_ethereum::Chain> {
             number: Some(U64::from(ptr.number)),
             ..Default::default()
         })),
-        trigger_data: vec![EthereumTrigger::Block(ptr, EthereumBlockTriggerType::Every)],
+        trigger_data: vec![EthereumTrigger::Block(ptr, EthereumBlockTriggerType::End)],
     }
+}
+
+pub fn generate_empty_blocks_for_range(
+    parent_ptr: BlockPtr,
+    start: i32,
+    end: i32,
+) -> Vec<BlockWithTriggers<graph_chain_ethereum::Chain>> {
+    (start + 1..end + 1).fold(
+        vec![empty_block(parent_ptr.clone(), test_ptr(start))],
+        |mut blocks, i| {
+            let parent_ptr = blocks.last().unwrap().ptr().clone();
+            blocks.push(empty_block(parent_ptr, test_ptr(i)));
+            blocks
+        },
+    )
 }
 
 pub fn empty_block(
@@ -120,7 +135,7 @@ pub fn empty_block(
             transactions,
             ..Default::default()
         })),
-        trigger_data: vec![EthereumTrigger::Block(ptr, EthereumBlockTriggerType::Every)],
+        trigger_data: vec![EthereumTrigger::Block(ptr, EthereumBlockTriggerType::End)],
     }
 }
 
@@ -140,5 +155,12 @@ pub fn push_test_log(block: &mut BlockWithTriggers<Chain>, payload: impl Into<St
             removed: None,
         }),
         None,
+    ))
+}
+
+pub fn push_test_polling_trigger(block: &mut BlockWithTriggers<Chain>) {
+    block.trigger_data.push(EthereumTrigger::Block(
+        block.ptr(),
+        EthereumBlockTriggerType::End,
     ))
 }

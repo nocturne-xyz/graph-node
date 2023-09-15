@@ -10,7 +10,7 @@ use graph::{
     },
     runtime::{
         asc_get, asc_new, gas::GasCounter, AscHeap, AscIndexId, AscPtr, AscType,
-        DeterministicHostError, FromAscObj, IndexForAscTypeId, ToAscObj,
+        DeterministicHostError, FromAscObj, HostExportError, IndexForAscTypeId, ToAscObj,
     },
 };
 use graph_runtime_derive::AscType;
@@ -42,7 +42,7 @@ impl ToAscObj<AscLogParamArray> for Vec<ethabi::LogParam> {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscLogParamArray, DeterministicHostError> {
+    ) -> Result<AscLogParamArray, HostExportError> {
         let content: Result<Vec<_>, _> = self.iter().map(|x| asc_new(heap, x, gas)).collect();
         let content = content?;
         Ok(AscLogParamArray(Array::new(&content, heap, gas)?))
@@ -73,7 +73,7 @@ impl ToAscObj<AscTopicArray> for Vec<H256> {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscTopicArray, DeterministicHostError> {
+    ) -> Result<AscTopicArray, HostExportError> {
         let topics = self
             .iter()
             .map(|topic| asc_new(heap, topic, gas))
@@ -106,7 +106,7 @@ impl ToAscObj<AscLogArray> for Vec<Log> {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscLogArray, DeterministicHostError> {
+    ) -> Result<AscLogArray, HostExportError> {
         let logs = self
             .iter()
             .map(|log| asc_new(heap, &log, gas))
@@ -138,13 +138,14 @@ impl FromAscObj<AscUnresolvedContractCall_0_0_4> for UnresolvedContractCall {
         asc_call: AscUnresolvedContractCall_0_0_4,
         heap: &H,
         gas: &GasCounter,
+        depth: usize,
     ) -> Result<Self, DeterministicHostError> {
         Ok(UnresolvedContractCall {
-            contract_name: asc_get(heap, asc_call.contract_name, gas)?,
-            contract_address: asc_get(heap, asc_call.contract_address, gas)?,
-            function_name: asc_get(heap, asc_call.function_name, gas)?,
-            function_signature: Some(asc_get(heap, asc_call.function_signature, gas)?),
-            function_args: asc_get(heap, asc_call.function_args, gas)?,
+            contract_name: asc_get(heap, asc_call.contract_name, gas, depth)?,
+            contract_address: asc_get(heap, asc_call.contract_address, gas, depth)?,
+            function_name: asc_get(heap, asc_call.function_name, gas, depth)?,
+            function_signature: Some(asc_get(heap, asc_call.function_signature, gas, depth)?),
+            function_args: asc_get(heap, asc_call.function_args, gas, depth)?,
         })
     }
 }
@@ -163,13 +164,14 @@ impl FromAscObj<AscUnresolvedContractCall> for UnresolvedContractCall {
         asc_call: AscUnresolvedContractCall,
         heap: &H,
         gas: &GasCounter,
+        depth: usize,
     ) -> Result<Self, DeterministicHostError> {
         Ok(UnresolvedContractCall {
-            contract_name: asc_get(heap, asc_call.contract_name, gas)?,
-            contract_address: asc_get(heap, asc_call.contract_address, gas)?,
-            function_name: asc_get(heap, asc_call.function_name, gas)?,
+            contract_name: asc_get(heap, asc_call.contract_name, gas, depth)?,
+            contract_address: asc_get(heap, asc_call.contract_address, gas, depth)?,
+            function_name: asc_get(heap, asc_call.function_name, gas, depth)?,
             function_signature: None,
-            function_args: asc_get(heap, asc_call.function_args, gas)?,
+            function_args: asc_get(heap, asc_call.function_args, gas, depth)?,
         })
     }
 }
@@ -416,7 +418,7 @@ impl ToAscObj<AscEthereumBlock> for EthereumBlockData {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumBlock, DeterministicHostError> {
+    ) -> Result<AscEthereumBlock, HostExportError> {
         Ok(AscEthereumBlock {
             hash: asc_new(heap, &self.hash, gas)?,
             parent_hash: asc_new(heap, &self.parent_hash, gas)?,
@@ -448,7 +450,7 @@ impl ToAscObj<AscEthereumBlock_0_0_6> for EthereumBlockData {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumBlock_0_0_6, DeterministicHostError> {
+    ) -> Result<AscEthereumBlock_0_0_6, HostExportError> {
         Ok(AscEthereumBlock_0_0_6 {
             hash: asc_new(heap, &self.hash, gas)?,
             parent_hash: asc_new(heap, &self.parent_hash, gas)?,
@@ -484,10 +486,10 @@ impl ToAscObj<AscEthereumTransaction_0_0_1> for EthereumTransactionData {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumTransaction_0_0_1, DeterministicHostError> {
+    ) -> Result<AscEthereumTransaction_0_0_1, HostExportError> {
         Ok(AscEthereumTransaction_0_0_1 {
             hash: asc_new(heap, &self.hash, gas)?,
-            index: asc_new(heap, &BigInt::from(self.index), gas)?,
+            index: asc_new(heap, &BigInt::from_unsigned_u128(self.index), gas)?,
             from: asc_new(heap, &self.from, gas)?,
             to: self
                 .to
@@ -505,10 +507,10 @@ impl ToAscObj<AscEthereumTransaction_0_0_2> for EthereumTransactionData {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumTransaction_0_0_2, DeterministicHostError> {
+    ) -> Result<AscEthereumTransaction_0_0_2, HostExportError> {
         Ok(AscEthereumTransaction_0_0_2 {
             hash: asc_new(heap, &self.hash, gas)?,
-            index: asc_new(heap, &BigInt::from(self.index), gas)?,
+            index: asc_new(heap, &BigInt::from_unsigned_u128(self.index), gas)?,
             from: asc_new(heap, &self.from, gas)?,
             to: self
                 .to
@@ -527,10 +529,10 @@ impl ToAscObj<AscEthereumTransaction_0_0_6> for EthereumTransactionData {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumTransaction_0_0_6, DeterministicHostError> {
+    ) -> Result<AscEthereumTransaction_0_0_6, HostExportError> {
         Ok(AscEthereumTransaction_0_0_6 {
             hash: asc_new(heap, &self.hash, gas)?,
-            index: asc_new(heap, &BigInt::from(self.index), gas)?,
+            index: asc_new(heap, &BigInt::from_unsigned_u128(self.index), gas)?,
             from: asc_new(heap, &self.from, gas)?,
             to: self
                 .to
@@ -556,7 +558,7 @@ where
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumEvent<T, B>, DeterministicHostError> {
+    ) -> Result<AscEthereumEvent<T, B>, HostExportError> {
         Ok(AscEthereumEvent {
             address: asc_new(heap, &self.address, gas)?,
             log_index: asc_new(heap, &BigInt::from_unsigned_u256(&self.log_index), gas)?,
@@ -589,7 +591,7 @@ where
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumEvent_0_0_7<T, B>, DeterministicHostError> {
+    ) -> Result<AscEthereumEvent_0_0_7<T, B>, HostExportError> {
         let (event_data, optional_receipt) = self;
         let AscEthereumEvent {
             address,
@@ -623,7 +625,7 @@ impl ToAscObj<AscEthereumLog> for Log {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumLog, DeterministicHostError> {
+    ) -> Result<AscEthereumLog, HostExportError> {
         Ok(AscEthereumLog {
             address: asc_new(heap, &self.address, gas)?,
             topics: asc_new(heap, &self.topics, gas)?,
@@ -670,7 +672,7 @@ impl ToAscObj<AscEthereumTransactionReceipt> for &TransactionReceipt {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumTransactionReceipt, DeterministicHostError> {
+    ) -> Result<AscEthereumTransactionReceipt, HostExportError> {
         Ok(AscEthereumTransactionReceipt {
             transaction_hash: asc_new(heap, &self.transaction_hash, gas)?,
             transaction_index: asc_new(heap, &BigInt::from(self.transaction_index), gas)?,
@@ -714,7 +716,7 @@ impl ToAscObj<AscEthereumCall> for EthereumCallData {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscEthereumCall, DeterministicHostError> {
+    ) -> Result<AscEthereumCall, HostExportError> {
         Ok(AscEthereumCall {
             address: asc_new(heap, &self.to, gas)?,
             block: asc_new(heap, &self.block, gas)?,
@@ -734,7 +736,7 @@ impl ToAscObj<AscEthereumCall_0_0_3<AscEthereumTransaction_0_0_2, AscEthereumBlo
         gas: &GasCounter,
     ) -> Result<
         AscEthereumCall_0_0_3<AscEthereumTransaction_0_0_2, AscEthereumBlock>,
-        DeterministicHostError,
+        HostExportError,
     > {
         Ok(AscEthereumCall_0_0_3 {
             to: asc_new(heap, &self.to, gas)?,
@@ -756,7 +758,7 @@ impl ToAscObj<AscEthereumCall_0_0_3<AscEthereumTransaction_0_0_6, AscEthereumBlo
         gas: &GasCounter,
     ) -> Result<
         AscEthereumCall_0_0_3<AscEthereumTransaction_0_0_6, AscEthereumBlock_0_0_6>,
-        DeterministicHostError,
+        HostExportError,
     > {
         Ok(AscEthereumCall_0_0_3 {
             to: asc_new(heap, &self.to, gas)?,
@@ -774,7 +776,7 @@ impl ToAscObj<AscLogParam> for ethabi::LogParam {
         &self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscLogParam, DeterministicHostError> {
+    ) -> Result<AscLogParam, HostExportError> {
         Ok(AscLogParam {
             name: asc_new(heap, self.name.as_str(), gas)?,
             value: asc_new(heap, &self.value, gas)?,

@@ -16,9 +16,11 @@ use graph::blockchain::{
     TriggersAdapter, TriggersAdapterSelector,
 };
 use graph::cheap_clone::CheapClone;
-use graph::components::metrics::{MetricsRegistry, MetricsRegistryTrait};
+use graph::components::link_resolver::{ArweaveClient, ArweaveResolver, FileSizeLimit};
+use graph::components::metrics::MetricsRegistry;
 use graph::components::store::{BlockStore, DeploymentLocator};
-use graph::data::graphql::effort::LoadManager;
+use graph::components::subgraph::Settings;
+use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::{Query, QueryTarget};
 use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
 use graph::env::EnvVars;
@@ -32,7 +34,7 @@ use graph::prelude::{
     TriggerProcessor,
 };
 use graph::slog::crit;
-use graph_core::polling_monitor::ipfs_service;
+use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_core::{
     LinkResolver, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
     SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar, SubgraphTriggerProcessor,
@@ -95,6 +97,7 @@ pub struct TestContext {
     pub subgraph_name: SubgraphName,
     pub instance_manager: SubgraphInstanceManager<graph_store_postgres::SubgraphStore>,
     pub link_resolver: Arc<dyn graph::components::link_resolver::LinkResolver>,
+    pub arweave_resolver: Arc<dyn ArweaveResolver>,
     pub env_vars: Arc<EnvVars>,
     pub ipfs: IpfsClient,
     graphql_runner: Arc<GraphQlRunner>,
@@ -171,7 +174,7 @@ impl TestContext {
 
         wait_for_sync(
             &self.logger,
-            &self.store,
+            self.store.clone(),
             &self.deployment.clone(),
             stop_block,
         )
@@ -190,7 +193,7 @@ impl TestContext {
 
         wait_for_sync(
             &self.logger,
-            &self.store,
+            self.store.clone(),
             &self.deployment.clone(),
             stop_block,
         )
@@ -261,7 +264,7 @@ impl Drop for TestContext {
 pub struct Stores {
     network_name: String,
     chain_head_listener: Arc<ChainHeadUpdateListener>,
-    network_store: Arc<Store>,
+    pub network_store: Arc<Store>,
     chain_store: Arc<ChainStore>,
 }
 
@@ -289,7 +292,7 @@ pub async fn stores(store_config_path: &str) -> Stores {
     };
 
     let logger = graph::log::logger(true);
-    let mock_registry: Arc<dyn MetricsRegistryTrait> = Arc::new(MetricsRegistry::mock());
+    let mock_registry: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     let node_id = NodeId::new(NODE_ID).unwrap();
     let store_builder =
         StoreBuilder::new(&logger, &node_id, &config, None, mock_registry.clone()).await;
@@ -298,11 +301,13 @@ pub async fn stores(store_config_path: &str) -> Stores {
     let chain_head_listener = store_builder.chain_head_update_listener();
     let network_identifiers = vec![(
         network_name.clone(),
-        (vec![ChainIdentifier {
+        ChainIdentifier {
             net_version: "".into(),
             genesis_block_hash: test_ptr(0).hash,
-        }]),
-    )];
+        },
+    )]
+    .into_iter()
+    .collect();
     let network_store = store_builder.network_store(network_identifiers);
     let chain_store = network_store
         .block_store()
@@ -331,7 +336,7 @@ pub async fn setup<C: Blockchain>(
     });
 
     let logger = graph::log::logger(true);
-    let mock_registry: Arc<dyn MetricsRegistryTrait> = Arc::new(MetricsRegistry::mock());
+    let mock_registry: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     let logger_factory = LoggerFactory::new(logger.clone(), None, mock_registry.clone());
     let node_id = NodeId::new(NODE_ID).unwrap();
 
@@ -355,6 +360,17 @@ pub async fn setup<C: Blockchain>(
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
+
+    let arweave_resolver = Arc::new(ArweaveClient::default());
+    let arweave_service = arweave_service(
+        arweave_resolver.cheap_clone(),
+        env_vars.mappings.ipfs_timeout,
+        env_vars.mappings.ipfs_request_limit,
+        match env_vars.mappings.max_ipfs_file_bytes {
+            0 => FileSizeLimit::Unlimited,
+            n => FileSizeLimit::MaxBytes(n as u64),
+        },
+    );
     let sg_count = Arc::new(SubgraphCountMetric::new(mock_registry.cheap_clone()));
 
     let blockchain_map = Arc::new(blockchain_map);
@@ -367,12 +383,13 @@ pub async fn setup<C: Blockchain>(
         mock_registry.clone(),
         link_resolver.cheap_clone(),
         ipfs_service,
+        arweave_service,
         static_filters,
     );
 
     // Graphql runner
     let subscription_manager = Arc::new(PanicSubscriptionManager {});
-    let load_manager = LoadManager::new(&logger, Vec::new(), mock_registry.clone());
+    let load_manager = LoadManager::new(&logger, Vec::new(), Vec::new(), mock_registry.clone());
     let graphql_runner = Arc::new(GraphQlRunner::new(
         &logger,
         stores.network_store.clone(),
@@ -408,6 +425,7 @@ pub async fn setup<C: Blockchain>(
         blockchain_map.clone(),
         node_id.clone(),
         SubgraphVersionSwitchingMode::Instant,
+        Arc::new(Settings::default()),
     ));
 
     SubgraphRegistrar::create_subgraph(subgraph_registrar.as_ref(), subgraph_name.clone())
@@ -422,9 +440,12 @@ pub async fn setup<C: Blockchain>(
         None,
         None,
         graft_block,
+        None,
     )
     .await
     .expect("failed to create subgraph version");
+
+    let arweave_resolver = Arc::new(ArweaveClient::default());
 
     TestContext {
         logger: logger_factory.subgraph_logger(&deployment),
@@ -438,6 +459,7 @@ pub async fn setup<C: Blockchain>(
         env_vars,
         indexing_status_service,
         ipfs,
+        arweave_resolver,
     }
 }
 
@@ -456,13 +478,32 @@ pub fn cleanup(
 
 pub async fn wait_for_sync(
     logger: &Logger,
-    store: &SubgraphStore,
+    store: Arc<SubgraphStore>,
     deployment: &DeploymentLocator,
     stop_block: BlockPtr,
 ) -> Result<(), SubgraphError> {
+    /// We flush here to speed up how long the write queue waits before it
+    /// considers a batch complete and writable. Without flushing, we would
+    /// have to wait for `GRAPH_STORE_WRITE_BATCH_DURATION` before all
+    /// changes have been written to the database
+    async fn flush(logger: &Logger, store: &Arc<SubgraphStore>, deployment: &DeploymentLocator) {
+        store
+            .clone()
+            .writable(logger.clone(), deployment.id, Arc::new(vec![]))
+            .await
+            .unwrap()
+            .flush()
+            .await
+            .unwrap();
+    }
+
     let mut err_count = 0;
+
+    flush(logger, &store, deployment).await;
+
     while err_count < 10 {
         tokio::time::sleep(Duration::from_millis(1000)).await;
+        flush(logger, &store, deployment).await;
 
         let block_ptr = match store.least_block_ptr(&deployment.hash).await {
             Ok(Some(ptr)) => ptr,
@@ -472,7 +513,7 @@ pub async fn wait_for_sync(
                 continue;
             }
         };
-
+        info!(logger, "TEST: sync status: {:?}", block_ptr);
         let status = store.status_for_id(deployment.id);
 
         if let Some(fatal_error) = status.fatal_error {

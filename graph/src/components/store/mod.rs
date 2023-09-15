@@ -1,13 +1,16 @@
 mod entity_cache;
 mod err;
 mod traits;
+pub mod write;
 
-pub use entity_cache::{EntityCache, ModificationsAndCache};
+pub use entity_cache::{EntityCache, GetScope, ModificationsAndCache};
 
 use diesel::types::{FromSql, ToSql};
 pub use err::StoreError;
 use itertools::Itertools;
+use strum_macros::Display;
 pub use traits::*;
+pub use write::Batch;
 
 use futures::stream::poll_fn;
 use futures::{Async, Poll, Stream};
@@ -17,21 +20,25 @@ use std::borrow::Borrow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{fmt, io};
 
 use crate::blockchain::Block;
+use crate::components::store::write::EntityModification;
 use crate::data::store::scalar::Bytes;
 use crate::data::store::*;
-use crate::data::value::Word;
+use crate::data::value::{Object, Word};
 use crate::data_source::CausalityRegion;
-use crate::prelude::*;
+use crate::schema::InputSchema;
+use crate::util::intern;
+use crate::{constraint_violation, prelude::*};
 
 /// The type name of an entity. This is the string that is used in the
 /// subgraph's GraphQL schema as `type NAME @entity { .. }`
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityType(Word);
 
 impl EntityType {
@@ -106,6 +113,11 @@ impl ToSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
     }
 }
 
+impl std::fmt::Debug for EntityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EntityType({})", self.0)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityFilterDerivative(bool);
 
@@ -121,7 +133,7 @@ impl EntityFilterDerivative {
 
 /// Key by which an individual entity in the store can be accessed. Stores
 /// only the entity type and id. The deployment must be known from context.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityKey {
     /// Name of the entity type.
     pub entity_type: EntityType,
@@ -138,6 +150,73 @@ pub struct EntityKey {
 }
 
 impl EntityKey {
+    pub fn unknown_attribute(&self, err: intern::Error) -> StoreError {
+        StoreError::UnknownAttribute(self.entity_type.to_string(), err.not_interned())
+    }
+}
+
+impl std::fmt::Debug for EntityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EntityKey({}[{}], cr={})",
+            self.entity_type, self.entity_id, self.causality_region
+        )
+    }
+}
+#[derive(Debug, Clone)]
+pub struct LoadRelatedRequest {
+    /// Name of the entity type.
+    pub entity_type: EntityType,
+    /// ID of the individual entity.
+    pub entity_id: Word,
+    /// Field the shall be loaded
+    pub entity_field: Word,
+
+    /// This is the causality region of the data source that created the entity.
+    ///
+    /// In the case of an entity lookup, this is the causality region of the data source that is
+    /// doing the lookup. So if the entity exists but was created on a different causality region,
+    /// the lookup will return empty.
+    pub causality_region: CausalityRegion,
+}
+
+#[derive(Debug)]
+pub struct DerivedEntityQuery {
+    /// Name of the entity to search
+    pub entity_type: EntityType,
+    /// The field to check
+    pub entity_field: Word,
+    /// The value to compare against
+    pub value: Word,
+    /// Boolean indicating if the id is of the type `Bytes`
+    pub id_is_bytes: bool,
+
+    /// This is the causality region of the data source that created the entity.
+    ///
+    /// In the case of an entity lookup, this is the causality region of the data source that is
+    /// doing the lookup. So if the entity exists but was created on a different causality region,
+    /// the lookup will return empty.
+    pub causality_region: CausalityRegion,
+}
+
+impl DerivedEntityQuery {
+    /// Checks if a given key and entity match this query.
+    pub fn matches(&self, key: &EntityKey, entity: &Entity) -> bool {
+        key.entity_type == self.entity_type
+            && entity
+                .get(&self.entity_field)
+                .map(|v| match v {
+                    Value::String(s) => s.as_str() == self.value.as_str(),
+                    Value::Bytes(b) => Bytes::from_str(self.value.as_str())
+                        .map_or(false, |bytes_value| &bytes_value == b),
+                    _ => false,
+                })
+                .unwrap_or(false)
+    }
+}
+
+impl EntityKey {
     // For use in tests only
     #[cfg(debug_assertions)]
     pub fn data(entity_type: impl Into<String>, entity_id: impl Into<String>) -> Self {
@@ -145,6 +224,15 @@ impl EntityKey {
             entity_type: EntityType::new(entity_type.into()),
             entity_id: entity_id.into().into(),
             causality_region: CausalityRegion::ONCHAIN,
+        }
+    }
+
+    pub fn from(id: &String, load_related_request: &LoadRelatedRequest) -> Self {
+        let clone = load_related_request.clone();
+        Self {
+            entity_id: id.clone().into(),
+            entity_type: clone.entity_type,
+            causality_region: clone.causality_region,
         }
     }
 }
@@ -322,10 +410,23 @@ pub struct EntityRange {
 }
 
 impl EntityRange {
+    /// The default value for `first` that we use when the user doesn't
+    /// specify one
+    pub const FIRST: u32 = 100;
+
     /// Query for the first `n` entities.
     pub fn first(n: u32) -> Self {
         Self {
             first: Some(n),
+            skip: 0,
+        }
+    }
+}
+
+impl std::default::Default for EntityRange {
+    fn default() -> Self {
+        Self {
+            first: Some(Self::FIRST),
             skip: 0,
         }
     }
@@ -360,7 +461,7 @@ pub enum ParentLink {
     /// The parent stores the id of one child. The ith entry in the
     /// vector contains the id of the child of the parent with id
     /// `EntityWindow.ids[i]`
-    Scalar(Vec<String>),
+    Scalar(Vec<Option<String>>),
 }
 
 /// How many children a parent can have when the child stores
@@ -380,6 +481,84 @@ pub enum EntityLink {
     Direct(WindowAttribute, ChildMultiplicity),
     /// Join with the parents table to get at the parent id
     Parent(EntityType, ParentLink),
+}
+
+impl EntityLink {
+    /// Return a list of objects that have only the `id`, parent id, and
+    /// typename set using the child ids from `self` when `self` is
+    /// `Parent`. If `self` is `Direct`, return `None`
+    ///
+    /// The list that is returned is sorted and truncated to `first` many
+    /// entries.
+    ///
+    /// This makes it possible to avoid running a query when all that is
+    /// needed is the `id` of the children
+    pub fn to_basic_objects(self, parents: &Vec<String>, first: usize) -> Option<Vec<Object>> {
+        use crate::data::value::Value as V;
+
+        fn basic_object(entity_type: &EntityType, parent: &str, child: String) -> Object {
+            let mut obj = Vec::new();
+            obj.push((ID.clone(), V::String(child)));
+            obj.push((Word::from("__typename"), V::String(entity_type.to_string())));
+            obj.push((PARENT_ID.clone(), V::String(parent.to_string())));
+            Object::from_iter(obj)
+        }
+
+        fn basic_objects(
+            entity_type: &EntityType,
+            parent: &str,
+            children: Vec<String>,
+        ) -> Vec<Object> {
+            children
+                .into_iter()
+                .map(|child| basic_object(entity_type, parent, child))
+                .collect()
+        }
+
+        fn obj_key<'a>(obj: &'a Object) -> Option<(&'a str, &'a str)> {
+            match (obj.get(&*PARENT_ID), obj.get(ID.as_str())) {
+                (Some(V::String(p)), Some(V::String(id))) => Some((p, id)),
+                _ => None,
+            }
+        }
+
+        fn obj_cmp(a: &Object, b: &Object) -> std::cmp::Ordering {
+            obj_key(a).cmp(&obj_key(b))
+        }
+
+        match self {
+            EntityLink::Direct(_, _) => return None,
+            EntityLink::Parent(entity_type, link) => {
+                let mut objects = Vec::new();
+                match link {
+                    ParentLink::List(ids) => {
+                        for (parent, children) in parents.iter().zip(ids) {
+                            objects.extend(basic_objects(&entity_type, parent, children));
+                        }
+                    }
+                    ParentLink::Scalar(ids) => {
+                        for (parent, child) in parents.iter().zip(ids) {
+                            if let Some(child) = child {
+                                objects.push(basic_object(&entity_type, parent, child));
+                            }
+                        }
+                    }
+                }
+                // Sort the objects by parent id and child id just as
+                // running a query would
+                objects.sort_by(obj_cmp);
+                objects.truncate(first);
+                Some(objects)
+            }
+        }
+    }
+
+    pub fn has_child_ids(&self) -> bool {
+        match self {
+            EntityLink::Direct(_, _) => false,
+            EntityLink::Parent(_, _) => true,
+        }
+    }
 }
 
 /// Window results of an `EntityQuery` query along the parent's id:
@@ -503,7 +682,7 @@ impl EntityQuery {
             collection,
             filter: None,
             order: EntityOrder::Default,
-            range: EntityRange::first(100),
+            range: EntityRange::default(),
             logger: None,
             query_id: None,
             trace: false,
@@ -637,10 +816,14 @@ pub struct StoreEvent {
 
 impl StoreEvent {
     pub fn new(changes: Vec<EntityChange>) -> StoreEvent {
+        let changes = changes.into_iter().collect();
+        StoreEvent::from_set(changes)
+    }
+
+    fn from_set(changes: HashSet<EntityChange>) -> StoreEvent {
         static NEXT_TAG: AtomicUsize = AtomicUsize::new(0);
 
         let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-        let changes = changes.into_iter().collect();
         StoreEvent { tag, changes }
     }
 
@@ -651,15 +834,28 @@ impl StoreEvent {
         let changes: Vec<_> = mods
             .into_iter()
             .map(|op| {
-                use self::EntityModification::*;
+                use EntityModification::*;
                 match op {
-                    Insert { key, .. } | Overwrite { key, .. } | Remove { key } => {
+                    Insert { key, .. } | Overwrite { key, .. } | Remove { key, .. } => {
                         EntityChange::for_data(subgraph_id.clone(), key.clone())
                     }
                 }
             })
             .collect();
         StoreEvent::new(changes)
+    }
+
+    pub fn from_types(deployment: &DeploymentHash, entity_types: HashSet<EntityType>) -> Self {
+        let changes =
+            HashSet::from_iter(
+                entity_types
+                    .into_iter()
+                    .map(|entity_type| EntityChange::Data {
+                        subgraph_id: deployment.clone(),
+                        entity_type,
+                    }),
+            );
+        Self::from_set(changes)
     }
 
     /// Extend `ev1` with `ev2`. If `ev1` is `None`, just set it to `ev2`
@@ -917,84 +1113,6 @@ impl Display for DeploymentLocator {
 // connection checkouts
 pub type PoolWaitStats = Arc<RwLock<MovingStats>>;
 
-/// An entity operation that can be transacted into the store; as opposed to
-/// `EntityOperation`, we already know whether a `Set` should be an `Insert`
-/// or `Update`
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EntityModification {
-    /// Insert the entity
-    Insert { key: EntityKey, data: Entity },
-    /// Update the entity by overwriting it
-    Overwrite { key: EntityKey, data: Entity },
-    /// Remove the entity
-    Remove { key: EntityKey },
-}
-
-impl EntityModification {
-    pub fn entity_ref(&self) -> &EntityKey {
-        use EntityModification::*;
-        match self {
-            Insert { key, .. } | Overwrite { key, .. } | Remove { key } => key,
-        }
-    }
-
-    pub fn entity(&self) -> Option<&Entity> {
-        match self {
-            EntityModification::Insert { data, .. }
-            | EntityModification::Overwrite { data, .. } => Some(data),
-            EntityModification::Remove { .. } => None,
-        }
-    }
-
-    pub fn is_remove(&self) -> bool {
-        match self {
-            EntityModification::Remove { .. } => true,
-            _ => false,
-        }
-    }
-}
-
-/// A representation of entity operations that can be accumulated.
-#[derive(Debug, Clone)]
-enum EntityOp {
-    Remove,
-    Update(Entity),
-    Overwrite(Entity),
-}
-
-impl EntityOp {
-    fn apply_to(self, entity: Option<Entity>) -> Option<Entity> {
-        use EntityOp::*;
-        match (self, entity) {
-            (Remove, _) => None,
-            (Overwrite(new), _) | (Update(new), None) => Some(new),
-            (Update(updates), Some(mut entity)) => {
-                entity.merge_remove_null_fields(updates);
-                Some(entity)
-            }
-        }
-    }
-
-    fn accumulate(&mut self, next: EntityOp) {
-        use EntityOp::*;
-        let update = match next {
-            // Remove and Overwrite ignore the current value.
-            Remove | Overwrite(_) => {
-                *self = next;
-                return;
-            }
-            Update(update) => update,
-        };
-
-        // We have an update, apply it.
-        match self {
-            // This is how `Overwrite` is constructed, by accumulating `Update` onto `Remove`.
-            Remove => *self = Overwrite(update),
-            Update(current) | Overwrite(current) => current.merge(update),
-        }
-    }
-}
-
 /// Determines which columns should be selected in a table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AttributeNames {
@@ -1108,11 +1226,11 @@ impl fmt::Display for DeploymentSchemaVersion {
 
 /// A `ReadStore` that is always empty.
 pub struct EmptyStore {
-    schema: Arc<Schema>,
+    schema: Arc<InputSchema>,
 }
 
 impl EmptyStore {
-    pub fn new(schema: Arc<Schema>) -> Self {
+    pub fn new(schema: Arc<InputSchema>) -> Self {
         EmptyStore { schema }
     }
 }
@@ -1126,7 +1244,14 @@ impl ReadStore for EmptyStore {
         Ok(BTreeMap::new())
     }
 
-    fn input_schema(&self) -> Arc<Schema> {
+    fn get_derived(
+        &self,
+        _query: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        Ok(BTreeMap::new())
+    }
+
+    fn input_schema(&self) -> Arc<InputSchema> {
         self.schema.cheap_clone()
     }
 }
@@ -1140,28 +1265,196 @@ pub struct VersionStats {
     pub tablename: String,
     /// The ratio `entities / versions`
     pub ratio: f64,
+    /// The last block to which this table was pruned
+    pub last_pruned_block: Option<BlockNumber>,
+}
+
+/// What phase of pruning we are working on
+pub enum PrunePhase {
+    /// Handling final entities
+    CopyFinal,
+    /// Handling nonfinal entities
+    CopyNonfinal,
+    /// Delete unneeded entity versions
+    Delete,
+}
+
+impl PrunePhase {
+    pub fn strategy(&self) -> PruningStrategy {
+        match self {
+            PrunePhase::CopyFinal | PrunePhase::CopyNonfinal => PruningStrategy::Rebuild,
+            PrunePhase::Delete => PruningStrategy::Delete,
+        }
+    }
 }
 
 /// Callbacks for `SubgraphStore.prune` so that callers can report progress
 /// of the pruning procedure to users
 #[allow(unused_variables)]
 pub trait PruneReporter: Send + 'static {
+    /// A pruning run has started. It will use the given `strategy` and
+    /// remove `history_frac` part of the blocks of the deployment, which
+    /// amounts to `history_blocks` many blocks.
+    ///
+    /// Before pruning, the subgraph has data for blocks from
+    /// `earliest_block` to `latest_block`
+    fn start(&mut self, req: &PruneRequest) {}
+
     fn start_analyze(&mut self) {}
     fn start_analyze_table(&mut self, table: &str) {}
     fn finish_analyze_table(&mut self, table: &str) {}
-    fn finish_analyze(&mut self, stats: &[VersionStats]) {}
 
-    fn copy_final_start(&mut self, earliest_block: BlockNumber, final_block: BlockNumber) {}
-    fn copy_final_batch(&mut self, table: &str, rows: usize, total_rows: usize, finished: bool) {}
-    fn copy_final_finish(&mut self) {}
+    /// Analyzing tables has finished. `stats` are the stats for all tables
+    /// in the deployment, `analyzed ` are the names of the tables that were
+    /// actually analyzed
+    fn finish_analyze(&mut self, stats: &[VersionStats], analyzed: &[&str]) {}
 
+    fn start_table(&mut self, table: &str) {}
+    fn prune_batch(&mut self, table: &str, rows: usize, phase: PrunePhase, finished: bool) {}
     fn start_switch(&mut self) {}
-    fn copy_nonfinal_start(&mut self, table: &str) {}
-    fn copy_nonfinal_batch(&mut self, table: &str, rows: usize, total_rows: usize, finished: bool) {
-    }
     fn finish_switch(&mut self) {}
+    fn finish_table(&mut self, table: &str) {}
 
-    fn finish_prune(&mut self) {}
+    fn finish(&mut self) {}
+}
+
+/// Select how pruning should be done
+#[derive(Clone, Copy, Debug, Display, PartialEq)]
+pub enum PruningStrategy {
+    /// Rebuild by copying the data we want to keep to new tables and swap
+    /// them out for the existing tables
+    Rebuild,
+    /// Delete unneeded data from the existing tables
+    Delete,
+}
+
+#[derive(Copy, Clone)]
+/// A request to prune a deployment. This struct encapsulates decision
+/// making around the best strategy for pruning (deleting historical
+/// entities or copying current ones) It needs to be filled with accurate
+/// information about the deployment that should be pruned.
+pub struct PruneRequest {
+    /// How many blocks of history to keep
+    pub history_blocks: BlockNumber,
+    /// The reorg threshold for the chain the deployment is on
+    pub reorg_threshold: BlockNumber,
+    /// The earliest block pruning should preserve
+    pub earliest_block: BlockNumber,
+    /// The last block that contains final entities not subject to a reorg
+    pub final_block: BlockNumber,
+    /// The latest block, i.e., the subgraph head
+    pub latest_block: BlockNumber,
+    /// Use the rebuild strategy when removing more than this fraction of
+    /// history. Initialized from `ENV_VARS.store.rebuild_threshold`, but
+    /// can be modified after construction
+    pub rebuild_threshold: f64,
+    /// Use the delete strategy when removing more than this fraction of
+    /// history but less than `rebuild_threshold`. Initialized from
+    /// `ENV_VARS.store.delete_threshold`, but can be modified after
+    /// construction
+    pub delete_threshold: f64,
+}
+
+impl PruneRequest {
+    /// Create a `PruneRequest` for a deployment that currently contains
+    /// entities for blocks from `first_block` to `latest_block` that should
+    /// retain only `history_blocks` blocks of history and is subject to a
+    /// reorg threshold of `reorg_threshold`.
+    pub fn new(
+        deployment: &DeploymentLocator,
+        history_blocks: BlockNumber,
+        reorg_threshold: BlockNumber,
+        first_block: BlockNumber,
+        latest_block: BlockNumber,
+    ) -> Result<Self, StoreError> {
+        let rebuild_threshold = ENV_VARS.store.rebuild_threshold;
+        let delete_threshold = ENV_VARS.store.delete_threshold;
+        if rebuild_threshold < 0.0 || rebuild_threshold > 1.0 {
+            return Err(constraint_violation!(
+                "the copy threshold must be between 0 and 1 but is {rebuild_threshold}"
+            ));
+        }
+        if delete_threshold < 0.0 || delete_threshold > 1.0 {
+            return Err(constraint_violation!(
+                "the delete threshold must be between 0 and 1 but is {delete_threshold}"
+            ));
+        }
+        if history_blocks <= reorg_threshold {
+            return Err(constraint_violation!(
+                "the deployment {} needs to keep at least {} blocks \
+                   of history and can't be pruned to only {} blocks of history",
+                deployment,
+                reorg_threshold + 1,
+                history_blocks
+            ));
+        }
+        if first_block >= latest_block {
+            return Err(constraint_violation!(
+                "the earliest block {} must be before the latest block {}",
+                first_block,
+                latest_block
+            ));
+        }
+
+        let earliest_block = latest_block - history_blocks;
+        let final_block = latest_block - reorg_threshold;
+
+        Ok(Self {
+            history_blocks,
+            reorg_threshold,
+            earliest_block,
+            final_block,
+            latest_block,
+            rebuild_threshold,
+            delete_threshold,
+        })
+    }
+
+    /// Determine what strategy to use for pruning
+    ///
+    /// We are pruning `history_pct` of the blocks from a table that has a
+    /// ratio of `version_ratio` entities to versions. If we are removing
+    /// more than `rebuild_threshold` percent of the versions, we prune by
+    /// rebuilding, and if we are removing more than `delete_threshold`
+    /// percent of the versions, we prune by deleting. If we would remove
+    /// less than `delete_threshold` percent of the versions, we don't
+    /// prune.
+    pub fn strategy(&self, stats: &VersionStats) -> Option<PruningStrategy> {
+        // If the deployment doesn't have enough history to cover the reorg
+        // threshold, do not prune
+        if self.earliest_block >= self.final_block {
+            return None;
+        }
+
+        // Estimate how much data we will throw away; we assume that
+        // entity versions are distributed evenly across all blocks so
+        // that `history_pct` will tell us how much of that data pruning
+        // will remove.
+        let removal_ratio = self.history_pct(stats) * (1.0 - stats.ratio);
+        if removal_ratio >= self.rebuild_threshold {
+            Some(PruningStrategy::Rebuild)
+        } else if removal_ratio >= self.delete_threshold {
+            Some(PruningStrategy::Delete)
+        } else {
+            None
+        }
+    }
+
+    /// Return an estimate of the fraction of the entities that are
+    /// historical in the table whose `stats` we are given
+    fn history_pct(&self, stats: &VersionStats) -> f64 {
+        let total_blocks = self.latest_block - stats.last_pruned_block.unwrap_or(0);
+        if total_blocks <= 0 || total_blocks < self.history_blocks {
+            // Something has gone very wrong; this could happen if the
+            // subgraph is ever rewound to before the last_pruned_block or
+            // if this is called when the subgraph has fewer blocks than
+            // history_blocks. In both cases, which should be transient,
+            // pretend that we would not delete any history
+            0.0
+        } else {
+            1.0 - self.history_blocks as f64 / total_blocks as f64
+        }
+    }
 }
 
 /// Represents an item retrieved from an

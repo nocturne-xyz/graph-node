@@ -28,7 +28,11 @@ pub mod firehose;
 
 pub mod substreams;
 
+pub mod substreams_rpc;
+
 pub mod endpoint;
+
+pub mod schema;
 
 /// Helpers for parsing environment variables.
 pub mod env;
@@ -49,6 +53,7 @@ pub use semver;
 pub use slog;
 pub use stable_hash_legacy;
 pub use tokio;
+pub use tokio_retry;
 pub use tokio_stream;
 pub use url;
 
@@ -60,7 +65,6 @@ pub use url;
 /// use graph::prelude::*;
 /// ```
 pub mod prelude {
-    pub use super::entity;
     pub use ::anyhow;
     pub use anyhow::{anyhow, Context as _, Error};
     pub use async_trait::async_trait;
@@ -86,6 +90,7 @@ pub mod prelude {
     pub use serde;
     pub use serde_derive::{Deserialize, Serialize};
     pub use serde_json;
+    pub use serde_regex;
     pub use serde_yaml;
     pub use slog::{self, crit, debug, error, info, o, trace, warn, Logger};
     pub use std::convert::TryFrom;
@@ -97,6 +102,7 @@ pub mod prelude {
     pub use thiserror;
     pub use tiny_keccak;
     pub use tokio;
+    pub use toml;
     pub use tonic;
     pub use web3;
 
@@ -109,9 +115,7 @@ pub mod prelude {
         EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
         LightEthereumBlockExt,
     };
-    pub use crate::components::graphql::{
-        GraphQLMetrics, GraphQlRunner, QueryLoadManager, SubscriptionResultFuture,
-    };
+    pub use crate::components::graphql::{GraphQLMetrics, GraphQlRunner, SubscriptionResultFuture};
     pub use crate::components::link_resolver::{JsonStreamValue, JsonValueStream, LinkResolver};
     pub use crate::components::metrics::{
         stopwatch::StopwatchMetrics, subgraph::*, Collector, Counter, CounterVec, Gauge, GaugeVec,
@@ -121,13 +125,13 @@ pub mod prelude {
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        AttributeNames, BlockNumber, CachedEthereumCall, ChainStore, Child, ChildMultiplicity,
-        EntityCache, EntityChange, EntityChangeOperation, EntityCollection, EntityFilter,
-        EntityLink, EntityModification, EntityOperation, EntityOrder, EntityOrderByChild,
-        EntityOrderByChildInfo, EntityQuery, EntityRange, EntityWindow, EthereumCallCache,
-        ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore, QueryStoreManager, StoreError,
-        StoreEvent, StoreEventStream, StoreEventStreamBox, SubgraphStore, UnfailOutcome,
-        WindowAttribute, BLOCK_NUMBER_MAX,
+        write::EntityModification, AttributeNames, BlockNumber, CachedEthereumCall, ChainStore,
+        Child, ChildMultiplicity, EntityCache, EntityChange, EntityChangeOperation,
+        EntityCollection, EntityFilter, EntityLink, EntityOperation, EntityOrder,
+        EntityOrderByChild, EntityOrderByChildInfo, EntityQuery, EntityRange, EntityWindow,
+        EthereumCallCache, ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore,
+        QueryStoreManager, StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox,
+        SubgraphStore, UnfailOutcome, WindowAttribute, BLOCK_NUMBER_MAX,
     };
     pub use crate::components::subgraph::{
         BlockState, DataSourceTemplateInfo, HostMetrics, RuntimeHost, RuntimeHostBuilder,
@@ -146,12 +150,10 @@ pub mod prelude {
     pub use crate::data::query::{
         Query, QueryError, QueryExecutionError, QueryResult, QueryTarget, QueryVariables,
     };
-    pub use crate::data::schema::{ApiSchema, Schema};
     pub use crate::data::store::ethereum::*;
     pub use crate::data::store::scalar::{BigDecimal, BigInt, BigIntSign};
     pub use crate::data::store::{
-        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, TryIntoEntity, Value,
-        ValueType,
+        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, Value, ValueType,
     };
     pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{
@@ -200,7 +202,7 @@ pub mod prelude {
     });
     static_graphql!(s, schema, {
         Field, Directive, InterfaceType, ObjectType, Value, TypeDefinition,
-        EnumType, Type, Document, ScalarType, InputValue, DirectiveDefinition,
+        EnumType, Type, Definition, Document, ScalarType, InputValue, DirectiveDefinition,
         UnionType, InputObjectType, EnumValue,
     });
 

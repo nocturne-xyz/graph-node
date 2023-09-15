@@ -1,3 +1,4 @@
+use graph::blockchain::MappingTriggerTrait;
 use graph::blockchain::TriggerData;
 use graph::data::subgraph::API_VERSION_0_0_2;
 use graph::data::subgraph::API_VERSION_0_0_6;
@@ -21,7 +22,7 @@ use graph::runtime::asc_new;
 use graph::runtime::gas::GasCounter;
 use graph::runtime::AscHeap;
 use graph::runtime::AscPtr;
-use graph::runtime::DeterministicHostError;
+use graph::runtime::HostExportError;
 use graph::semver::Version;
 use graph_runtime_wasm::module::ToAscPtr;
 use std::convert::TryFrom;
@@ -59,6 +60,21 @@ pub enum MappingTrigger {
     Block {
         block: Arc<LightEthereumBlock>,
     },
+}
+
+impl MappingTriggerTrait for MappingTrigger {
+    fn error_context(&self) -> std::string::String {
+        let transaction_id = match self {
+            MappingTrigger::Log { log, .. } => log.transaction_hash,
+            MappingTrigger::Call { call, .. } => call.transaction_hash,
+            MappingTrigger::Block { .. } => None,
+        };
+
+        match transaction_id {
+            Some(tx_hash) => format!("transaction {:x}", tx_hash),
+            None => String::new(),
+        }
+    }
 }
 
 // Logging the block is too verbose, so this strips the block from the trigger for Debug.
@@ -116,7 +132,7 @@ impl ToAscPtr for MappingTrigger {
         self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscPtr<()>, DeterministicHostError> {
+    ) -> Result<AscPtr<()>, HostExportError> {
         Ok(match self {
             MappingTrigger::Log {
                 block,
@@ -244,7 +260,8 @@ impl Eq for EthereumTrigger {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EthereumBlockTriggerType {
-    Every,
+    Start,
+    End,
     WithCallTo(Address),
 }
 
@@ -266,15 +283,34 @@ impl EthereumTrigger {
             EthereumTrigger::Log(log, _) => log.block_hash.unwrap(),
         }
     }
+
+    /// `None` means the trigger matches any address.
+    pub fn address(&self) -> Option<&Address> {
+        match self {
+            EthereumTrigger::Block(_, EthereumBlockTriggerType::WithCallTo(address)) => {
+                Some(address)
+            }
+            EthereumTrigger::Call(call) => Some(&call.to),
+            EthereumTrigger::Log(log, _) => Some(&log.address),
+
+            // Unfiltered block triggers match any data source address.
+            EthereumTrigger::Block(_, EthereumBlockTriggerType::End) => None,
+            EthereumTrigger::Block(_, EthereumBlockTriggerType::Start) => None,
+        }
+    }
 }
 
 impl Ord for EthereumTrigger {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
+            // Block triggers with `EthereumBlockTriggerType::Start` always come
+            (Self::Block(_, EthereumBlockTriggerType::Start), _) => Ordering::Less,
+            (_, Self::Block(_, EthereumBlockTriggerType::Start)) => Ordering::Greater,
+
             // Keep the order when comparing two block triggers
             (Self::Block(..), Self::Block(..)) => Ordering::Equal,
 
-            // Block triggers always come last
+            // Block triggers with `EthereumBlockTriggerType::End` always come last
             (Self::Block(..), _) => Ordering::Greater,
             (_, Self::Block(..)) => Ordering::Less,
 
@@ -331,6 +367,10 @@ impl TriggerData for EthereumTrigger {
             ),
             None => String::new(),
         }
+    }
+
+    fn address_match(&self) -> Option<&[u8]> {
+        self.address().map(|address| address.as_bytes())
     }
 }
 

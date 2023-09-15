@@ -1,4 +1,5 @@
 use graph::blockchain::Block;
+use graph::blockchain::MappingTriggerTrait;
 use graph::blockchain::TriggerData;
 use graph::cheap_clone::CheapClone;
 use graph::prelude::web3::types::H256;
@@ -7,7 +8,7 @@ use graph::runtime::asc_new;
 use graph::runtime::gas::GasCounter;
 use graph::runtime::AscHeap;
 use graph::runtime::AscPtr;
-use graph::runtime::DeterministicHostError;
+use graph::runtime::HostExportError;
 use graph_runtime_wasm::module::ToAscPtr;
 use std::{cmp::Ordering, sync::Arc};
 
@@ -38,7 +39,7 @@ impl ToAscPtr for ArweaveTrigger {
         self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscPtr<()>, DeterministicHostError> {
+    ) -> Result<AscPtr<()>, HostExportError> {
         Ok(match self {
             ArweaveTrigger::Block(block) => asc_new(heap, block.as_ref(), gas)?.erase(),
             ArweaveTrigger::Transaction(tx) => asc_new(heap, tx.as_ref(), gas)?.erase(),
@@ -87,6 +88,22 @@ impl ArweaveTrigger {
             ArweaveTrigger::Transaction(tx) => tx.block.ptr().hash_as_h256(),
         }
     }
+
+    fn error_context(&self) -> std::string::String {
+        match self {
+            ArweaveTrigger::Block(..) => {
+                format!("Block #{} ({})", self.block_number(), self.block_hash())
+            }
+            ArweaveTrigger::Transaction(tx) => {
+                format!(
+                    "Tx #{}, block #{}({})",
+                    base64_url::encode(&tx.tx.id),
+                    self.block_number(),
+                    self.block_hash()
+                )
+            }
+        }
+    }
 }
 
 impl Ord for ArweaveTrigger {
@@ -113,20 +130,18 @@ impl PartialOrd for ArweaveTrigger {
 }
 
 impl TriggerData for ArweaveTrigger {
-    fn error_context(&self) -> std::string::String {
-        match self {
-            ArweaveTrigger::Block(..) => {
-                format!("Block #{} ({})", self.block_number(), self.block_hash())
-            }
-            ArweaveTrigger::Transaction(tx) => {
-                format!(
-                    "Tx #{}, block #{}({})",
-                    base64_url::encode(&tx.tx.id),
-                    self.block_number(),
-                    self.block_hash()
-                )
-            }
-        }
+    fn error_context(&self) -> String {
+        self.error_context()
+    }
+
+    fn address_match(&self) -> Option<&[u8]> {
+        None
+    }
+}
+
+impl MappingTriggerTrait for ArweaveTrigger {
+    fn error_context(&self) -> String {
+        self.error_context()
     }
 }
 

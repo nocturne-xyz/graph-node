@@ -11,7 +11,8 @@ use self::graphql::*;
 use self::mappings::*;
 use self::store::*;
 use crate::{
-    components::subgraph::SubgraphVersionSwitchingMode, runtime::gas::CONST_MAX_GAS_PER_HANDLER,
+    components::{store::BlockNumber, subgraph::SubgraphVersionSwitchingMode},
+    runtime::gas::CONST_MAX_GAS_PER_HANDLER,
 };
 
 lazy_static! {
@@ -133,8 +134,13 @@ pub struct EnvVars {
     /// Ceiling for the backoff retry of non-deterministic errors.
     ///
     /// Set by the environment variable `GRAPH_SUBGRAPH_ERROR_RETRY_CEIL_SECS`
-    /// (expressed in seconds). The default value is 1800s (30 minutes).
+    /// (expressed in seconds). The default value is 3600s (60 minutes).
     pub subgraph_error_retry_ceil: Duration,
+    /// Jitter factor for the backoff retry of non-deterministic errors.
+    ///
+    /// Set by the environment variable `GRAPH_SUBGRAPH_ERROR_RETRY_JITTER`
+    /// (clamped between 0.0 and 1.0). The default value is 0.2.
+    pub subgraph_error_retry_jitter: f64,
     /// Experimental feature.
     ///
     /// Set by the flag `GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES`. Off by
@@ -163,6 +169,12 @@ pub struct EnvVars {
     /// Maximum number of Dynamic Data Sources after which a Subgraph will
     /// switch to using static filter.
     pub static_filters_threshold: usize,
+    /// Set by the environment variable `ETHEREUM_REORG_THRESHOLD`. The default
+    /// value is 250 blocks.
+    pub reorg_threshold: BlockNumber,
+    /// Set by the env var `GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS` which should point
+    /// to a file with subgraph-specific settings
+    pub subgraph_settings: Option<String>,
 }
 
 impl EnvVars {
@@ -210,6 +222,7 @@ impl EnvVars {
             subgraph_max_data_sources: inner.subgraph_max_data_sources.0,
             disable_fail_fast: inner.disable_fail_fast.0,
             subgraph_error_retry_ceil: Duration::from_secs(inner.subgraph_error_retry_ceil_in_secs),
+            subgraph_error_retry_jitter: inner.subgraph_error_retry_jitter,
             enable_select_by_specific_attributes: inner.enable_select_by_specific_attributes.0,
             log_trigger_data: inner.log_trigger_data.0,
             explorer_ttl: Duration::from_secs(inner.explorer_ttl_in_secs),
@@ -218,6 +231,8 @@ impl EnvVars {
             external_http_base_url: inner.external_http_base_url,
             external_ws_base_url: inner.external_ws_base_url,
             static_filters_threshold: inner.static_filters_threshold,
+            reorg_threshold: inner.reorg_threshold,
+            subgraph_settings: inner.subgraph_settings,
         })
     }
 
@@ -270,7 +285,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.7")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.8")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_LOAD_WINDOW_SIZE", default = "300")]
     load_window_size_in_secs: u64,
@@ -313,8 +328,10 @@ struct Inner {
     subgraph_max_data_sources: NoUnderscores<usize>,
     #[envconfig(from = "GRAPH_DISABLE_FAIL_FAST", default = "false")]
     disable_fail_fast: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_SUBGRAPH_ERROR_RETRY_CEIL_SECS", default = "1800")]
+    #[envconfig(from = "GRAPH_SUBGRAPH_ERROR_RETRY_CEIL_SECS", default = "3600")]
     subgraph_error_retry_ceil_in_secs: u64,
+    #[envconfig(from = "GRAPH_SUBGRAPH_ERROR_RETRY_JITTER", default = "0.2")]
+    subgraph_error_retry_jitter: f64,
     #[envconfig(from = "GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES", default = "false")]
     enable_select_by_specific_attributes: EnvVarBoolean,
     #[envconfig(from = "GRAPH_LOG_TRIGGER_DATA", default = "false")]
@@ -329,9 +346,13 @@ struct Inner {
     external_http_base_url: Option<String>,
     #[envconfig(from = "EXTERNAL_WS_BASE_URL")]
     external_ws_base_url: Option<String>,
-    // Setting this to be unrealistically high so it doesn't get triggered.
-    #[envconfig(from = "GRAPH_STATIC_FILTERS_THRESHOLD", default = "100000000")]
+    #[envconfig(from = "GRAPH_STATIC_FILTERS_THRESHOLD", default = "10000")]
     static_filters_threshold: usize,
+    // JSON-RPC specific.
+    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD", default = "250")]
+    reorg_threshold: BlockNumber,
+    #[envconfig(from = "GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS")]
+    subgraph_settings: Option<String>,
 }
 
 #[derive(Clone, Debug)]

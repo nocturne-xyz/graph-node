@@ -11,7 +11,7 @@ use crate::relational::{
     VID_COLUMN,
 };
 
-use super::{Column, Layout, SqlName, Table};
+use super::{Catalog, Column, Layout, SqlName, Table};
 
 // In debug builds (for testing etc.) unconditionally create exclusion constraints, in release
 // builds for production, skip them
@@ -38,7 +38,7 @@ impl Layout {
         tables.sort_by_key(|table| table.position);
         // Output 'create table' statements for all tables
         for table in tables {
-            table.as_ddl(&mut out)?;
+            table.as_ddl(&self.catalog, &mut out)?;
         }
 
         Ok(out)
@@ -142,13 +142,15 @@ impl Table {
         }
     }
 
-    fn create_time_travel_indexes(&self, out: &mut String) -> fmt::Result {
+    fn create_time_travel_indexes(&self, catalog: &Catalog, out: &mut String) -> fmt::Result {
+        let (int4, int8) = catalog.minmax_ops();
+
         if self.immutable {
             write!(
                 out,
                 "create index brin_{table_name}\n    \
                 on {qname}\n \
-                   using brin({block}, vid);\n",
+                   using brin({block} {int4}, vid {int8});\n",
                 table_name = self.name,
                 qname = self.qualified_name,
                 block = BLOCK_COLUMN
@@ -177,7 +179,7 @@ impl Table {
             // entities are stored.
             write!(out,"create index brin_{table_name}\n    \
                 on {qname}\n \
-                   using brin(lower(block_range), coalesce(upper(block_range), {block_max}), vid);\n",
+                   using brin(lower(block_range) {int4}, coalesce(upper(block_range), {block_max}) {int4}, vid {int8});\n",
                 table_name = self.name,
                 qname = self.qualified_name,
                 block_max = BLOCK_NUMBER_MAX)?;
@@ -197,22 +199,33 @@ impl Table {
     }
 
     fn create_attribute_indexes(&self, out: &mut String) -> fmt::Result {
-        // Create indexes. Skip columns whose type is an array of enum,
-        // since there is no good way to index them with Postgres 9.6.
-        // Once we move to Postgres 11, we can enable that
-        // (tracked in graph-node issue #1330)
-        for (i, column) in self
+        // Create indexes.
+
+        // Skip columns whose type is an array of enum, since there is no
+        // good way to index them with Postgres 9.6. Once we move to
+        // Postgres 11, we can enable that (tracked in graph-node issue
+        // #1330)
+        let not_enum_list = |col: &&Column| !(col.is_list() && col.is_enum());
+
+        // We create a unique index on `id` in `create_table`
+        // and don't need an explicit attribute index
+        let not_immutable_pk = |col: &&Column| !(self.immutable && col.is_primary_key());
+
+        // GIN indexes on numeric types are not very useful, but expensive
+        // to build
+        let not_numeric_list = |col: &&Column| {
+            !(col.is_list()
+                && [ColumnType::BigDecimal, ColumnType::BigInt, ColumnType::Int]
+                    .contains(&col.column_type))
+        };
+        let columns = self
             .columns
             .iter()
-            .filter(|col| !(col.is_list() && col.is_enum()))
-            .enumerate()
-        {
-            if self.immutable && column.is_primary_key() {
-                // We create a unique index on `id` in `create_table`
-                // and don't need an explicit attribute index
-                continue;
-            }
+            .filter(not_enum_list)
+            .filter(not_immutable_pk)
+            .filter(not_numeric_list);
 
+        for (i, column) in columns.enumerate() {
             let (method, index_expr) = if column.is_reference() && !column.is_list() {
                 // For foreign keys, index the key together with the block range
                 // since we almost always also have a block_range clause in
@@ -275,9 +288,9 @@ impl Table {
     ///
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
-    pub(crate) fn as_ddl(&self, out: &mut String) -> fmt::Result {
+    pub(crate) fn as_ddl(&self, catalog: &Catalog, out: &mut String) -> fmt::Result {
         self.create_table(out)?;
-        self.create_time_travel_indexes(out)?;
+        self.create_time_travel_indexes(catalog, out)?;
         self.create_attribute_indexes(out)
     }
 

@@ -32,7 +32,7 @@ mod primary;
 pub mod query_store;
 mod relational;
 mod relational_queries;
-mod sql_value;
+mod retry;
 mod store;
 mod store_events;
 mod subgraph_store;
@@ -55,7 +55,7 @@ pub mod layout_for_tests {
 
 pub use self::block_store::BlockStore;
 pub use self::chain_head_listener::ChainHeadUpdateListener;
-pub use self::chain_store::ChainStore;
+pub use self::chain_store::{ChainStore, ChainStoreMetrics};
 pub use self::detail::DeploymentDetail;
 pub use self::jobs::register as register_jobs;
 pub use self::notification_listener::NotificationSender;

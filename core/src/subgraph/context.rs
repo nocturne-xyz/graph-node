@@ -1,20 +1,24 @@
 pub mod instance;
 
-use crate::polling_monitor::{spawn_monitor, IpfsService, PollingMonitor, PollingMonitorMetrics};
+use crate::polling_monitor::{
+    spawn_monitor, ArweaveService, IpfsService, PollingMonitor, PollingMonitorMetrics,
+};
 use anyhow::{self, Error};
 use bytes::Bytes;
 use graph::{
     blockchain::Blockchain,
     components::{
-        metrics::MetricsRegistryTrait,
         store::{DeploymentId, SubgraphFork},
         subgraph::{MappingError, SharedProofOfIndexing},
     },
-    data_source::{offchain, CausalityRegion, DataSource, TriggerData},
+    data_source::{
+        offchain::{self, Base64},
+        CausalityRegion, DataSource, TriggerData,
+    },
     ipfs_client::CidFile,
     prelude::{
-        BlockNumber, BlockState, CancelGuard, CheapClone, DeploymentHash, RuntimeHostBuilder,
-        SubgraphCountMetric, SubgraphInstanceMetrics, TriggerProcessor,
+        BlockNumber, BlockState, CancelGuard, CheapClone, DeploymentHash, MetricsRegistry,
+        RuntimeHostBuilder, SubgraphCountMetric, SubgraphInstanceMetrics, TriggerProcessor,
     },
     slog::Logger,
     tokio::sync::mpsc,
@@ -98,7 +102,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     ) -> Result<BlockState<C>, MappingError> {
         self.process_trigger_in_hosts(
             logger,
-            self.instance.hosts(),
+            self.instance.hosts_for_trigger(trigger),
             block,
             trigger,
             state,
@@ -114,7 +118,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     pub async fn process_trigger_in_hosts(
         &self,
         logger: &Logger,
-        hosts: &[Arc<T::Host>],
+        hosts: Box<dyn Iterator<Item = &T::Host> + Send + '_>,
         block: &Arc<C::Block>,
         trigger: &TriggerData<C>,
         state: BlockState<C>,
@@ -186,32 +190,45 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
 
 pub struct OffchainMonitor {
     ipfs_monitor: PollingMonitor<CidFile>,
-    ipfs_monitor_rx: mpsc::Receiver<(CidFile, Bytes)>,
+    ipfs_monitor_rx: mpsc::UnboundedReceiver<(CidFile, Bytes)>,
+    arweave_monitor: PollingMonitor<Base64>,
+    arweave_monitor_rx: mpsc::UnboundedReceiver<(Base64, Bytes)>,
 }
 
 impl OffchainMonitor {
     pub fn new(
         logger: Logger,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
         subgraph_hash: &DeploymentHash,
         ipfs_service: IpfsService,
+        arweave_service: ArweaveService,
     ) -> Self {
-        let (ipfs_monitor_tx, ipfs_monitor_rx) = mpsc::channel(10);
+        let metrics = Arc::new(PollingMonitorMetrics::new(registry, subgraph_hash));
+        // The channel is unbounded, as it is expected that `fn ready_offchain_events` is called
+        // frequently, or at least with the same frequency that requests are sent.
+        let (ipfs_monitor_tx, ipfs_monitor_rx) = mpsc::unbounded_channel();
+        let (arweave_monitor_tx, arweave_monitor_rx) = mpsc::unbounded_channel();
+
         let ipfs_monitor = spawn_monitor(
             ipfs_service,
             ipfs_monitor_tx,
-            logger,
-            PollingMonitorMetrics::new(registry, subgraph_hash),
+            logger.cheap_clone(),
+            metrics.cheap_clone(),
         );
+
+        let arweave_monitor = spawn_monitor(arweave_service, arweave_monitor_tx, logger, metrics);
         Self {
             ipfs_monitor,
             ipfs_monitor_rx,
+            arweave_monitor,
+            arweave_monitor_rx,
         }
     }
 
     fn add_source(&mut self, source: offchain::Source) -> Result<(), Error> {
         match source {
             offchain::Source::Ipfs(cid_file) => self.ipfs_monitor.monitor(cid_file),
+            offchain::Source::Arweave(base64) => self.arweave_monitor.monitor(base64),
         };
         Ok(())
     }
@@ -232,6 +249,20 @@ impl OffchainMonitor {
                 Err(TryRecvError::Empty) => break,
             }
         }
+
+        loop {
+            match self.arweave_monitor_rx.try_recv() {
+                Ok((base64, data)) => triggers.push(offchain::TriggerData {
+                    source: offchain::Source::Arweave(base64),
+                    data: Arc::new(data),
+                }),
+                Err(TryRecvError::Disconnected) => {
+                    anyhow::bail!("arweave monitor unexpectedly terminated")
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+
         Ok(triggers)
     }
 }

@@ -1,11 +1,66 @@
 use anyhow::anyhow;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use crate::components::store::{self as s, Entity, EntityKey, EntityOp, EntityOperation};
-use crate::prelude::{Schema, ENV_VARS};
-use crate::util::lfu_cache::LfuCache;
+use crate::cheap_clone::CheapClone;
+use crate::components::store::write::EntityModification;
+use crate::components::store::{self as s, Entity, EntityKey, EntityOperation};
+use crate::data::store::{EntityValidationError, IntoEntityIterator};
+use crate::prelude::ENV_VARS;
+use crate::schema::InputSchema;
+use crate::util::intern::Error as InternError;
+use crate::util::lfu_cache::{EvictStats, LfuCache};
+
+use super::{BlockNumber, DerivedEntityQuery, EntityType, LoadRelatedRequest, StoreError};
+
+/// The scope in which the `EntityCache` should perform a `get` operation
+pub enum GetScope {
+    /// Get from all previously stored entities in the store
+    Store,
+    /// Get from the entities that have been stored during this block
+    InBlock,
+}
+
+/// A representation of entity operations that can be accumulated.
+#[derive(Debug, Clone)]
+enum EntityOp {
+    Remove,
+    Update(Entity),
+    Overwrite(Entity),
+}
+
+impl EntityOp {
+    fn apply_to(self, entity: &mut Option<Cow<Entity>>) -> Result<(), InternError> {
+        use EntityOp::*;
+        match (self, entity) {
+            (Remove, e @ _) => *e = None,
+            (Overwrite(new), e @ _) | (Update(new), e @ None) => *e = Some(Cow::Owned(new)),
+            (Update(updates), Some(entity)) => entity.to_mut().merge_remove_null_fields(updates)?,
+        }
+        Ok(())
+    }
+
+    fn accumulate(&mut self, next: EntityOp) {
+        use EntityOp::*;
+        let update = match next {
+            // Remove and Overwrite ignore the current value.
+            Remove | Overwrite(_) => {
+                *self = next;
+                return;
+            }
+            Update(update) => update,
+        };
+
+        // We have an update, apply it.
+        match self {
+            // This is how `Overwrite` is constructed, by accumulating `Update` onto `Remove`.
+            Remove => *self = Overwrite(update),
+            Update(current) | Overwrite(current) => current.merge(update),
+        }
+    }
+}
 
 /// A cache for entities from the store that provides the basic functionality
 /// needed for the store interactions in the host exports. This struct tracks
@@ -31,7 +86,7 @@ pub struct EntityCache {
     /// The store is only used to read entities.
     pub store: Arc<dyn s::ReadStore>,
 
-    schema: Arc<Schema>,
+    pub schema: Arc<InputSchema>,
 }
 
 impl Debug for EntityCache {
@@ -46,6 +101,7 @@ impl Debug for EntityCache {
 pub struct ModificationsAndCache {
     pub modifications: Vec<s::EntityModification>,
     pub entity_lfu_cache: LfuCache<EntityKey, Option<Entity>>,
+    pub evict_stats: EvictStats,
 }
 
 impl EntityCache {
@@ -58,6 +114,14 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
         }
+    }
+
+    /// Make a new entity. The entity is not part of the cache
+    pub fn make_entity<I: IntoEntityIterator>(
+        &self,
+        iter: I,
+    ) -> Result<Entity, EntityValidationError> {
+        self.schema.make_entity(iter)
     }
 
     pub fn with_current(
@@ -96,21 +160,159 @@ impl EntityCache {
         self.handler_updates.clear();
     }
 
-    pub fn get(&mut self, eref: &EntityKey) -> Result<Option<Entity>, s::QueryExecutionError> {
+    pub fn get(
+        &mut self,
+        key: &EntityKey,
+        scope: GetScope,
+    ) -> Result<Option<Cow<Entity>>, StoreError> {
         // Get the current entity, apply any updates from `updates`, then
         // from `handler_updates`.
-        let mut entity = self.current.get_entity(&*self.store, eref)?;
+        let mut entity: Option<Cow<Entity>> = match scope {
+            GetScope::Store => {
+                if !self.current.contains_key(key) {
+                    let entity = self.store.get(key)?;
+                    self.current.insert(key.clone(), entity);
+                }
+                // Unwrap: we just inserted the entity
+                self.current.get(key).unwrap().as_ref().map(Cow::Borrowed)
+            }
+            GetScope::InBlock => None,
+        };
 
-        // Always test the cache consistency in debug mode.
-        debug_assert!(entity == self.store.get(eref).unwrap());
+        // Always test the cache consistency in debug mode. The test only
+        // makes sense when we were actually asked to read from the store
+        debug_assert!(match scope {
+            GetScope::Store => entity == self.store.get(key).unwrap().map(Cow::Owned),
+            GetScope::InBlock => true,
+        });
 
-        if let Some(op) = self.updates.get(eref).cloned() {
-            entity = op.apply_to(entity)
+        if let Some(op) = self.updates.get(key).cloned() {
+            op.apply_to(&mut entity)
+                .map_err(|e| key.unknown_attribute(e))?;
         }
-        if let Some(op) = self.handler_updates.get(eref).cloned() {
-            entity = op.apply_to(entity)
+        if let Some(op) = self.handler_updates.get(key).cloned() {
+            op.apply_to(&mut entity)
+                .map_err(|e| key.unknown_attribute(e))?;
         }
         Ok(entity)
+    }
+
+    pub fn load_related(
+        &mut self,
+        eref: &LoadRelatedRequest,
+    ) -> Result<Vec<Entity>, anyhow::Error> {
+        let (base_type, field, id_is_bytes) = self.schema.get_field_related(eref)?;
+
+        let query = DerivedEntityQuery {
+            entity_type: EntityType::new(base_type.to_string()),
+            entity_field: field.name.clone().into(),
+            value: eref.entity_id.clone(),
+            causality_region: eref.causality_region,
+            id_is_bytes,
+        };
+
+        let mut entity_map = self.store.get_derived(&query)?;
+
+        for (key, entity) in entity_map.iter() {
+            // Only insert to the cache if it's not already there
+            if !self.current.contains_key(&key) {
+                self.current.insert(key.clone(), Some(entity.clone()));
+            }
+        }
+
+        let mut keys_to_remove = Vec::new();
+
+        // Apply updates from `updates` and `handler_updates` directly to entities in `entity_map` that match the query
+        for (key, entity) in entity_map.iter_mut() {
+            let mut entity_cow = Some(Cow::Borrowed(entity));
+
+            if let Some(op) = self.updates.get(key).cloned() {
+                op.apply_to(&mut entity_cow)
+                    .map_err(|e| key.unknown_attribute(e))?;
+            }
+
+            if let Some(op) = self.handler_updates.get(key).cloned() {
+                op.apply_to(&mut entity_cow)
+                    .map_err(|e| key.unknown_attribute(e))?;
+            }
+
+            if let Some(updated_entity) = entity_cow {
+                *entity = updated_entity.into_owned();
+            } else {
+                // if entity_cow is None, it means that the entity was removed by an update
+                // mark the key for removal from the map
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        // A helper function that checks if an update matches the query and returns the updated entity if it does
+        fn matches_query(
+            op: &EntityOp,
+            query: &DerivedEntityQuery,
+            key: &EntityKey,
+        ) -> Result<Option<Entity>, anyhow::Error> {
+            match op {
+                EntityOp::Update(entity) | EntityOp::Overwrite(entity)
+                    if query.matches(key, entity) =>
+                {
+                    Ok(Some(entity.clone()))
+                }
+                EntityOp::Remove => Ok(None),
+                _ => Ok(None),
+            }
+        }
+
+        // Iterate over self.updates to find entities that:
+        // - Aren't already present in the entity_map
+        // - Match the query
+        // If these conditions are met:
+        // - Check if there's an update for the same entity in handler_updates and apply it.
+        // - Add the entity to entity_map.
+        for (key, op) in self.updates.iter() {
+            if !entity_map.contains_key(key) {
+                if let Some(entity) = matches_query(op, &query, key)? {
+                    if let Some(handler_op) = self.handler_updates.get(key).cloned() {
+                        // If there's a corresponding update in handler_updates, apply it to the entity
+                        // and insert the updated entity into entity_map
+                        let mut entity_cow = Some(Cow::Borrowed(&entity));
+                        handler_op
+                            .apply_to(&mut entity_cow)
+                            .map_err(|e| key.unknown_attribute(e))?;
+
+                        if let Some(updated_entity) = entity_cow {
+                            entity_map.insert(key.clone(), updated_entity.into_owned());
+                        }
+                    } else {
+                        // If there isn't a corresponding update in handler_updates or the update doesn't match the query, just insert the entity from self.updates
+                        entity_map.insert(key.clone(), entity);
+                    }
+                }
+            }
+        }
+
+        // Iterate over handler_updates to find entities that:
+        // - Aren't already present in the entity_map.
+        // - Aren't present in self.updates.
+        // - Match the query.
+        // If these conditions are met, add the entity to entity_map.
+        for (key, handler_op) in self.handler_updates.iter() {
+            if !entity_map.contains_key(key) && !self.updates.contains_key(key) {
+                if let Some(entity) = matches_query(handler_op, &query, key)? {
+                    entity_map.insert(key.clone(), entity);
+                }
+            }
+        }
+
+        // Remove entities that are in the store but have been removed by an update.
+        // We do this last since the loops over updates and handler_updates are only
+        // concerned with entities that are not in the store yet and by leaving removed
+        // keys in entity_map we avoid processing these updates a second time when we
+        // already looked at them when we went through entity_map
+        for key in keys_to_remove {
+            entity_map.remove(&key);
+        }
+
+        Ok(entity_map.into_values().collect())
     }
 
     pub fn remove(&mut self, key: EntityKey) {
@@ -122,35 +324,8 @@ impl EntityCache {
     /// with existing data. The entity will be validated against the
     /// subgraph schema, and any errors will result in an `Err` being
     /// returned.
-    pub fn set(&mut self, key: EntityKey, mut entity: Entity) -> Result<(), anyhow::Error> {
-        fn check_id(key: &EntityKey, prev_id: &str) -> Result<(), anyhow::Error> {
-            if prev_id != key.entity_id.as_str() {
-                Err(anyhow!(
-                    "Value of {} attribute 'id' conflicts with ID passed to `store.set()`: \
-                {} != {}",
-                    key.entity_type,
-                    prev_id,
-                    key.entity_id,
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        // Set the id if there isn't one yet, and make sure that a
-        // previously set id agrees with the one in the `key`
-        match entity.get("id") {
-            Some(s::Value::String(s)) => check_id(&key, s)?,
-            Some(s::Value::Bytes(b)) => check_id(&key, &b.to_string())?,
-            Some(_) => {
-                // The validation will catch the type mismatch
-            }
-            None => {
-                let value = self.schema.id_value(&key)?;
-                entity.set("id", value);
-            }
-        }
-
+    pub fn set(&mut self, key: EntityKey, entity: Entity) -> Result<(), anyhow::Error> {
+        // check the validate for derived fields
         let is_valid = entity.validate(&self.schema, &key).is_ok();
 
         self.entity_op(key.clone(), EntityOp::Update(entity));
@@ -159,14 +334,15 @@ impl EntityCache {
         // lookup in the database and check again with an entity that merges
         // the existing entity with the changes
         if !is_valid {
-            let entity = self.get(&key)?.ok_or_else(|| {
+            let schema = self.schema.cheap_clone();
+            let entity = self.get(&key, GetScope::Store)?.ok_or_else(|| {
                 anyhow!(
                     "Failed to read entity {}[{}] back from cache",
                     key.entity_type,
                     key.entity_id
                 )
             })?;
-            entity.validate(&self.schema, &key)?;
+            entity.validate(&schema, &key)?;
         }
 
         Ok(())
@@ -216,7 +392,10 @@ impl EntityCache {
     /// to the current state is actually needed.
     ///
     /// Also returns the updated `LfuCache`.
-    pub fn as_modifications(mut self) -> Result<ModificationsAndCache, s::QueryExecutionError> {
+    pub fn as_modifications(
+        mut self,
+        block: BlockNumber,
+    ) -> Result<ModificationsAndCache, StoreError> {
         assert!(!self.in_handler);
 
         // The first step is to make sure all entities being set are in `self.current`.
@@ -241,25 +420,35 @@ impl EntityCache {
 
         let mut mods = Vec::new();
         for (key, update) in self.updates {
-            use s::EntityModification::*;
+            use EntityModification::*;
 
             let current = self.current.remove(&key).and_then(|entity| entity);
             let modification = match (current, update) {
                 // Entity was created
-                (None, EntityOp::Update(updates)) | (None, EntityOp::Overwrite(updates)) => {
-                    // Merging with an empty entity removes null fields.
-                    let mut data = Entity::new();
-                    data.merge_remove_null_fields(updates);
-                    self.current.insert(key.clone(), Some(data.clone()));
-                    Some(Insert { key, data })
+                (None, EntityOp::Update(mut updates))
+                | (None, EntityOp::Overwrite(mut updates)) => {
+                    updates.remove_null_fields();
+                    self.current.insert(key.clone(), Some(updates.clone()));
+                    Some(Insert {
+                        key,
+                        data: updates,
+                        block,
+                        end: None,
+                    })
                 }
                 // Entity may have been changed
                 (Some(current), EntityOp::Update(updates)) => {
                     let mut data = current.clone();
-                    data.merge_remove_null_fields(updates);
+                    data.merge_remove_null_fields(updates)
+                        .map_err(|e| key.unknown_attribute(e))?;
                     self.current.insert(key.clone(), Some(data.clone()));
                     if current != data {
-                        Some(Overwrite { key, data })
+                        Some(Overwrite {
+                            key,
+                            data,
+                            block,
+                            end: None,
+                        })
                     } else {
                         None
                     }
@@ -268,7 +457,12 @@ impl EntityCache {
                 (Some(current), EntityOp::Overwrite(data)) => {
                     self.current.insert(key.clone(), Some(data.clone()));
                     if current != data {
-                        Some(Overwrite { key, data })
+                        Some(Overwrite {
+                            key,
+                            data,
+                            block,
+                            end: None,
+                        })
                     } else {
                         None
                     }
@@ -276,7 +470,7 @@ impl EntityCache {
                 // Existing entity was deleted
                 (Some(_), EntityOp::Remove) => {
                     self.current.insert(key.clone(), None);
-                    Some(Remove { key })
+                    Some(Remove { key, block })
                 }
                 // Entity was deleted, but it doesn't exist in the store
                 (None, EntityOp::Remove) => None,
@@ -285,33 +479,14 @@ impl EntityCache {
                 mods.push(modification)
             }
         }
-        self.current.evict(ENV_VARS.mappings.entity_cache_size);
+        let evict_stats = self
+            .current
+            .evict_and_stats(ENV_VARS.mappings.entity_cache_size);
 
         Ok(ModificationsAndCache {
             modifications: mods,
             entity_lfu_cache: self.current,
+            evict_stats,
         })
-    }
-}
-
-impl LfuCache<EntityKey, Option<Entity>> {
-    // Helper for cached lookup of an entity.
-    fn get_entity(
-        &mut self,
-        store: &(impl s::ReadStore + ?Sized),
-        key: &EntityKey,
-    ) -> Result<Option<Entity>, s::QueryExecutionError> {
-        match self.get(key) {
-            None => {
-                let mut entity = store.get(key)?;
-                if let Some(entity) = &mut entity {
-                    // `__typename` is for queries not for mappings.
-                    entity.remove("__typename");
-                }
-                self.insert(key.clone(), entity.clone());
-                Ok(entity)
-            }
-            Some(data) => Ok(data.clone()),
-        }
     }
 }

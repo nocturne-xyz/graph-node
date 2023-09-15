@@ -1,12 +1,10 @@
 use super::block_stream::SubstreamsMapper;
+use super::client::ChainClient;
 use crate::blockchain::block_stream::{BlockStream, BlockStreamEvent};
 use crate::blockchain::Blockchain;
-use crate::components::metrics::MetricsRegistryTrait;
-use crate::firehose::FirehoseEndpoint;
 use crate::prelude::*;
-use crate::substreams::response::Message;
-use crate::substreams::ForkStep::{StepNew, StepUndo};
-use crate::substreams::{Modules, Request, Response};
+use crate::substreams::Modules;
+use crate::substreams_rpc::{Request, Response};
 use crate::util::backoff::ExponentialBackoff;
 use async_stream::try_stream;
 use futures03::{Stream, StreamExt};
@@ -17,7 +15,6 @@ use tonic::Status;
 
 struct SubstreamsBlockStreamMetrics {
     deployment: DeploymentHash,
-    provider: String,
     restarts: CounterVec,
     connect_duration: GaugeVec,
     time_between_responses: HistogramVec,
@@ -25,15 +22,9 @@ struct SubstreamsBlockStreamMetrics {
 }
 
 impl SubstreamsBlockStreamMetrics {
-    pub fn new(
-        registry: Arc<dyn MetricsRegistryTrait>,
-        deployment: DeploymentHash,
-        provider: String,
-    ) -> Self {
+    pub fn new(registry: Arc<MetricsRegistry>, deployment: DeploymentHash) -> Self {
         Self {
             deployment,
-            provider,
-
             restarts: registry
                 .global_counter_vec(
                     "deployment_substreams_blockstream_restarts",
@@ -68,36 +59,36 @@ impl SubstreamsBlockStreamMetrics {
         }
     }
 
-    fn observe_successful_connection(&self, time: &mut Instant) {
+    fn observe_successful_connection(&self, time: &mut Instant, provider: &str) {
         self.restarts
-            .with_label_values(&[&self.deployment, &self.provider, "true"])
+            .with_label_values(&[&self.deployment, &provider, "true"])
             .inc();
         self.connect_duration
-            .with_label_values(&[&self.deployment, &self.provider])
+            .with_label_values(&[&self.deployment, &provider])
             .set(time.elapsed().as_secs_f64());
 
         // Reset last connection timestamp
         *time = Instant::now();
     }
 
-    fn observe_failed_connection(&self, time: &mut Instant) {
+    fn observe_failed_connection(&self, time: &mut Instant, provider: &str) {
         self.restarts
-            .with_label_values(&[&self.deployment, &self.provider, "false"])
+            .with_label_values(&[&self.deployment, &provider, "false"])
             .inc();
         self.connect_duration
-            .with_label_values(&[&self.deployment, &self.provider])
+            .with_label_values(&[&self.deployment, &provider])
             .set(time.elapsed().as_secs_f64());
 
         // Reset last connection timestamp
         *time = Instant::now();
     }
 
-    fn observe_response(&self, kind: &str, time: &mut Instant) {
+    fn observe_response(&self, kind: &str, time: &mut Instant, provider: &str) {
         self.time_between_responses
-            .with_label_values(&[&self.deployment, &self.provider])
+            .with_label_values(&[&self.deployment, &provider])
             .observe(time.elapsed().as_secs_f64());
         self.responses
-            .with_label_values(&[&self.deployment, &self.provider, kind])
+            .with_label_values(&[&self.deployment, &provider, kind])
             .inc();
 
         // Reset last response timestamp
@@ -117,7 +108,7 @@ where
 {
     pub fn new<F>(
         deployment: DeploymentHash,
-        endpoint: Arc<FirehoseEndpoint>,
+        client: Arc<ChainClient<C>>,
         subgraph_current_block: Option<BlockPtr>,
         cursor: Option<String>,
         mapper: Arc<F>,
@@ -126,7 +117,7 @@ where
         start_blocks: Vec<BlockNumber>,
         end_blocks: Vec<BlockNumber>,
         logger: Logger,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
     ) -> Self
     where
         F: SubstreamsMapper<C> + 'static,
@@ -135,13 +126,13 @@ where
 
         let manifest_end_block_num = end_blocks.into_iter().min().unwrap_or(0);
 
-        let metrics =
-            SubstreamsBlockStreamMetrics::new(registry, deployment, endpoint.provider.clone());
+        let metrics = SubstreamsBlockStreamMetrics::new(registry, deployment.clone());
 
         SubstreamsBlockStream {
             stream: Box::pin(stream_blocks(
-                endpoint,
+                client,
                 cursor,
+                deployment,
                 mapper,
                 modules,
                 module_name,
@@ -156,8 +147,9 @@ where
 }
 
 fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
-    endpoint: Arc<FirehoseEndpoint>,
+    client: Arc<ChainClient<C>>,
     cursor: Option<String>,
+    deployment: DeploymentHash,
     mapper: Arc<F>,
     modules: Option<Modules>,
     module_name: String,
@@ -187,13 +179,18 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
     let mut skip_backoff = false;
 
     try_stream! {
+            let endpoint = client.firehose_endpoint()?;
+            let mut logger = logger.new(o!("deployment" => deployment.clone(), "provider" => endpoint.provider.to_string()));
+
         loop {
             info!(
                 &logger,
                 "Blockstreams disconnected, connecting";
                 "endpoint_uri" => format_args!("{}", endpoint),
+                "subgraph" => &deployment,
                 "start_block" => start_block_num,
                 "cursor" => &latest_cursor,
+                "provider_err_count" => endpoint.current_error_count(),
             );
 
             // We just reconnected, assume that we want to back off on errors
@@ -204,13 +201,12 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
                 start_block_num,
                 start_cursor: latest_cursor.clone(),
                 stop_block_num,
-                fork_steps: vec![StepNew as i32, StepUndo as i32],
-                irreversibility_condition: "".to_string(),
                 modules: modules.clone(),
-                output_modules: vec![module_name.clone()],
+                output_module: module_name.clone(),
                 production_mode: true,
                 ..Default::default()
             };
+
 
             let result = endpoint.clone().substreams(request).await;
 
@@ -219,7 +215,7 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
                     info!(&logger, "Blockstreams connected");
 
                     // Track the time it takes to set up the block stream
-                    metrics.observe_successful_connection(&mut connect_start);
+                    metrics.observe_successful_connection(&mut connect_start, &endpoint.provider);
 
                     let mut last_response_time = Instant::now();
                     let mut expected_stream_end = false;
@@ -228,7 +224,7 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
                         match process_substreams_response(
                             response,
                             mapper.as_ref(),
-                            &logger,
+                            &mut logger,
                         ).await {
                             Ok(block_response) => {
                                 match block_response {
@@ -237,7 +233,7 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
                                         // Reset backoff because we got a good value from the stream
                                         backoff.reset();
 
-                                        metrics.observe_response("proceed", &mut last_response_time);
+                                        metrics.observe_response("proceed", &mut last_response_time, &endpoint.provider);
 
                                         yield event;
 
@@ -253,7 +249,7 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
                                 // An example of this situation is if we get invalid block or transaction data
                                 // that cannot be decoded properly.
 
-                                metrics.observe_response("error", &mut last_response_time);
+                                metrics.observe_response("error", &mut last_response_time, &endpoint.provider);
 
                                 error!(logger, "{:#}", err);
                                 expected_stream_end = true;
@@ -271,7 +267,7 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
                     // case where we actually _want_ to back off in case we keep
                     // having connection errors.
 
-                    metrics.observe_failed_connection(&mut connect_start);
+                    metrics.observe_failed_connection(&mut connect_start, &endpoint.provider);
 
                     error!(logger, "Unable to connect to endpoint: {:#}", e);
                 }
@@ -292,32 +288,28 @@ enum BlockResponse<C: Blockchain> {
 async fn process_substreams_response<C: Blockchain, F: SubstreamsMapper<C>>(
     result: Result<Response, Status>,
     mapper: &F,
-    logger: &Logger,
+    logger: &mut Logger,
 ) -> Result<Option<BlockResponse<C>>, Error> {
     let response = match result {
         Ok(v) => v,
         Err(e) => return Err(anyhow!("An error occurred while streaming blocks: {:#}", e)),
     };
 
-    match response.message {
-        Some(Message::Data(block_scoped_data)) => {
-            match mapper
-                .to_block_stream_event(logger, &block_scoped_data)
-                .await
-                .context("Mapping block to BlockStreamEvent failed")?
-            {
-                Some(event) => Ok(Some(BlockResponse::Proceed(
-                    event,
-                    block_scoped_data.cursor.to_string(),
-                ))),
-                None => Ok(None),
+    match mapper
+        .to_block_stream_event(logger, response.message)
+        .await
+        .context("Mapping message to BlockStreamEvent failed")?
+    {
+        Some(event) => {
+            let cursor = match &event {
+                BlockStreamEvent::Revert(_, cursor) => cursor,
+                BlockStreamEvent::ProcessBlock(_, cursor) => cursor,
             }
+            .to_string();
+
+            return Ok(Some(BlockResponse::Proceed(event, cursor)));
         }
-        None => {
-            warn!(&logger, "Got None on substream message");
-            Ok(None)
-        }
-        _ => Ok(None),
+        None => Ok(None), // some progress responses are ignored within to_block_stream_event
     }
 }
 

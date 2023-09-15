@@ -1,10 +1,10 @@
 use super::ObjectOrInterface;
-use crate::data::schema::{META_FIELD_TYPE, SCHEMA_TYPE_NAME};
 use crate::prelude::s::{
     Definition, Directive, Document, EnumType, Field, InterfaceType, ObjectType, Type,
     TypeDefinition, Value,
 };
 use crate::prelude::ENV_VARS;
+use crate::schema::{META_FIELD_TYPE, SCHEMA_TYPE_NAME};
 use std::collections::{BTreeMap, HashMap};
 
 pub trait ObjectTypeExt {
@@ -221,6 +221,19 @@ impl DocumentExt for Document {
             | TypeDefinition::Interface(_)
             | TypeDefinition::Union(_)
             | TypeDefinition::InputObject(_) => false,
+        }
+    }
+}
+
+pub trait DefinitionExt {
+    fn is_root_query_type(&self) -> bool;
+}
+
+impl DefinitionExt for Definition {
+    fn is_root_query_type(&self) -> bool {
+        match self {
+            Definition::TypeDefinition(TypeDefinition::Object(t)) => t.name == "Query",
+            _ => false,
         }
     }
 }

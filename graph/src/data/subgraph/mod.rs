@@ -10,15 +10,20 @@ pub mod status;
 
 pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
+use crate::object;
 use anyhow::{anyhow, Context, Error};
 use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
+use itertools::Itertools;
 use semver::Version;
 use serde::{de, ser};
 use serde_yaml;
 use slog::Logger;
 use stable_hash::{FieldAddress, StableHash};
 use stable_hash_legacy::SequenceNumber;
-use std::{collections::BTreeSet, marker::PhantomData};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    marker::PhantomData,
+};
 use thiserror::Error;
 use wasmparser;
 use web3::types::Address;
@@ -31,10 +36,7 @@ use crate::{
         store::{StoreError, SubgraphStore},
     },
     data::{
-        graphql::TryFromValue,
-        query::QueryExecutionError,
-        schema::{Schema, SchemaValidationError},
-        store::Entity,
+        graphql::TryFromValue, query::QueryExecutionError,
         subgraph::features::validate_subgraph_features,
     },
     data_source::{
@@ -42,7 +44,8 @@ use crate::{
         UnresolvedDataSourceTemplate,
     },
     ensure,
-    prelude::{r, CheapClone, ENV_VARS},
+    prelude::{r, CheapClone, Value, ENV_VARS},
+    schema::{InputSchema, SchemaValidationError},
 };
 
 use crate::prelude::{impl_slog_value, BlockNumber, Deserialize, Serialize};
@@ -51,6 +54,8 @@ use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use super::{graphql::IntoValue, value::Word};
 
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
@@ -218,6 +223,12 @@ impl SubgraphName {
         Ok(SubgraphName(s))
     }
 
+    /// Tests are allowed to create arbitrary subgraph names
+    #[cfg(debug_assertions)]
+    pub fn new_unchecked(s: impl Into<String>) -> Self {
+        SubgraphName(s.into())
+    }
+
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -350,8 +361,27 @@ pub enum SubgraphManifestResolveError {
     ResolveError(#[from] anyhow::Error),
 }
 
-/// Data source contexts are conveniently represented as entities.
-pub type DataSourceContext = Entity;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSourceContext(HashMap<Word, Value>);
+
+impl DataSourceContext {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    // This collects the entries into an ordered vector so that it can be iterated deterministically.
+    pub fn sorted(self) -> Vec<(Word, Value)> {
+        let mut v: Vec<_> = self.0.into_iter().collect();
+        v.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        v
+    }
+}
+
+impl From<HashMap<Word, Value>> for DataSourceContext {
+    fn from(map: HashMap<Word, Value>) -> Self {
+        Self(map)
+    }
+}
 
 /// IPLD link.
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
@@ -379,12 +409,12 @@ impl UnresolvedSchema {
         id: DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
-    ) -> Result<Schema, anyhow::Error> {
+    ) -> Result<InputSchema, anyhow::Error> {
         let schema_bytes = resolver
             .cat(logger, &self.file)
             .await
             .with_context(|| format!("failed to resolve schema {}", &self.file.link))?;
-        Schema::parse(&String::from_utf8(schema_bytes)?, id)
+        InputSchema::parse(&String::from_utf8(schema_bytes)?, id)
     }
 }
 
@@ -469,6 +499,31 @@ impl Graft {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DeploymentFeatures {
+    pub id: String,
+    pub spec_version: String,
+    pub api_version: Option<String>,
+    pub features: Vec<String>,
+    pub data_source_kinds: Vec<String>,
+    pub network: String,
+    pub handler_kinds: Vec<String>,
+}
+
+impl IntoValue for DeploymentFeatures {
+    fn into_value(self) -> r::Value {
+        object! {
+            __typename: "SubgraphFeatures",
+            specVersion: self.spec_version,
+            apiVersion: self.api_version,
+            features: self.features,
+            dataSources: self.data_source_kinds,
+            handlers: self.handler_kinds,
+            network: self.network,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaseSubgraphManifest<C, S, D, T> {
@@ -497,7 +552,7 @@ pub type UnresolvedSubgraphManifest<C> = BaseSubgraphManifest<
 
 /// SubgraphManifest validated with IPFS links resolved
 pub type SubgraphManifest<C> =
-    BaseSubgraphManifest<C, Schema, DataSource<C>, DataSourceTemplate<C>>;
+    BaseSubgraphManifest<C, InputSchema, DataSource<C>, DataSourceTemplate<C>>;
 
 /// Unvalidated SubgraphManifest
 pub struct UnvalidatedSubgraphManifest<C: Blockchain>(SubgraphManifest<C>);
@@ -635,6 +690,55 @@ impl<C: Blockchain> SubgraphManifest<C> {
             .chain(self.data_sources.iter().map(|source| source.api_version()))
     }
 
+    pub fn deployment_features(&self) -> DeploymentFeatures {
+        let unified_api_version = self.unified_mapping_api_version().ok();
+        let network = self.network_name();
+        let api_version = unified_api_version
+            .map(|v| v.version().map(|v| v.to_string()))
+            .flatten();
+
+        let handler_kinds = self
+            .data_sources
+            .iter()
+            .map(|ds| ds.handler_kinds())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        let features: Vec<String> = self
+            .features
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>();
+
+        let spec_version = self.spec_version.to_string();
+
+        let mut data_source_kinds = self
+            .data_sources
+            .iter()
+            .map(|ds| ds.kind().to_string())
+            .collect::<HashSet<_>>();
+
+        let data_source_template_kinds = self
+            .templates
+            .iter()
+            .map(|t| t.kind().to_string())
+            .collect::<Vec<_>>();
+
+        data_source_kinds.extend(data_source_template_kinds);
+        DeploymentFeatures {
+            id: self.id.to_string(),
+            api_version,
+            features,
+            spec_version,
+            data_source_kinds: data_source_kinds.into_iter().collect_vec(),
+            handler_kinds: handler_kinds
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect_vec(),
+            network,
+        }
+    }
+
     pub fn runtimes(&self) -> impl Iterator<Item = Arc<Vec<u8>>> + '_ {
         self.templates
             .iter()
@@ -745,11 +849,26 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
         if spec_version < SPEC_VERSION_0_0_7
             && data_sources
                 .iter()
-                .any(|ds| OFFCHAIN_KINDS.contains(&ds.kind()))
+                .any(|ds| OFFCHAIN_KINDS.contains_key(ds.kind().as_str()))
         {
             bail!(
                 "Offchain data sources not supported prior to {}",
                 SPEC_VERSION_0_0_7
+            );
+        }
+
+        // Check the min_spec_version of each data source against the spec version of the subgraph
+        let min_spec_version_mismatch = data_sources
+            .iter()
+            .find(|ds| spec_version < ds.min_spec_version());
+
+        if let Some(min_spec_version_mismatch) = min_spec_version_mismatch {
+            bail!(
+                "Subgraph `{}` uses spec version {}, but data source `{}` requires at least version {}",
+                id,
+                spec_version,
+                min_spec_version_mismatch.name(),
+                min_spec_version_mismatch.min_spec_version()
             );
         }
 

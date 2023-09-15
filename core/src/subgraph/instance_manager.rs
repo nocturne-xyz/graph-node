@@ -1,4 +1,4 @@
-use crate::polling_monitor::IpfsService;
+use crate::polling_monitor::{ArweaveService, IpfsService};
 use crate::subgraph::context::{IndexingContext, SubgraphKeepAlive};
 use crate::subgraph::inputs::IndexingInputs;
 use crate::subgraph::loader::load_dynamic_data_sources;
@@ -8,7 +8,6 @@ use graph::blockchain::block_stream::BlockStreamMetrics;
 use graph::blockchain::Blockchain;
 use graph::blockchain::NodeCapabilities;
 use graph::blockchain::{BlockchainKind, TriggerFilter};
-use graph::components::metrics::MetricsRegistryTrait;
 use graph::components::subgraph::ProofOfIndexingVersion;
 use graph::data::subgraph::{UnresolvedSubgraphManifest, SPEC_VERSION_0_0_6};
 use graph::data_source::causality_region::CausalityRegionSeq;
@@ -27,10 +26,11 @@ pub struct SubgraphInstanceManager<S: SubgraphStore> {
     logger_factory: LoggerFactory,
     subgraph_store: Arc<S>,
     chains: Arc<BlockchainMap>,
-    metrics_registry: Arc<dyn MetricsRegistryTrait>,
+    metrics_registry: Arc<MetricsRegistry>,
     instances: SubgraphKeepAlive,
     link_resolver: Arc<dyn LinkResolver>,
     ipfs_service: IpfsService,
+    arweave_service: ArweaveService,
     static_filters: bool,
     env_vars: Arc<EnvVars>,
 }
@@ -163,9 +163,10 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         subgraph_store: Arc<S>,
         chains: Arc<BlockchainMap>,
         sg_metrics: Arc<SubgraphCountMetric>,
-        metrics_registry: Arc<dyn MetricsRegistryTrait>,
+        metrics_registry: Arc<MetricsRegistry>,
         link_resolver: Arc<dyn LinkResolver>,
         ipfs_service: IpfsService,
+        arweave_service: ArweaveService,
         static_filters: bool,
     ) -> Self {
         let logger = logger_factory.component_logger("SubgraphInstanceManager", None);
@@ -181,6 +182,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             ipfs_service,
             static_filters,
             env_vars,
+            arweave_service,
         }
     }
 
@@ -199,12 +201,6 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
     {
         let subgraph_store = self.subgraph_store.cheap_clone();
         let registry = self.metrics_registry.cheap_clone();
-
-        let store = self
-            .subgraph_store
-            .cheap_clone()
-            .writable(logger.clone(), deployment.id)
-            .await?;
 
         let raw_yaml = serde_yaml::to_string(&manifest).unwrap();
         let manifest = UnresolvedSubgraphManifest::parse(deployment.hash.cheap_clone(), manifest)?;
@@ -257,7 +253,21 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             );
         }
 
-        let manifest_idx_and_name: Vec<(u32, String)> = manifest.template_idx_and_name().collect();
+        let store = self
+            .subgraph_store
+            .cheap_clone()
+            .writable(
+                logger.clone(),
+                deployment.id,
+                Arc::new(manifest.template_idx_and_name().collect()),
+            )
+            .await?;
+
+        // Create deployment features from the manifest
+        // Write it to the database
+        let deployment_features = manifest.deployment_features();
+        self.subgraph_store
+            .create_subgraph_features(deployment_features)?;
 
         // Start the subgraph deployment before reading dynamic data
         // sources; if the subgraph is a graft or a copy, starting it will
@@ -380,6 +390,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             registry.cheap_clone(),
             &manifest.id,
             self.ipfs_service.clone(),
+            self.arweave_service.clone(),
         );
 
         // Initialize deployment_head with current deployment head. Any sort of trouble in
@@ -426,7 +437,6 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             templates,
             unified_api_version,
             static_filters,
-            manifest_idx_and_name,
             poi_version,
             network,
             instrument,

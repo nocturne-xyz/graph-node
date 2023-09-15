@@ -1,4 +1,5 @@
 use crate::prelude::{q, s, CacheWeight};
+use crate::runtime::gas::{Gas, GasSizeOf, SaturatingInto};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -67,6 +68,47 @@ impl<'de> serde::Deserialize<'de> for Word {
     }
 }
 
+impl stable_hash_legacy::StableHash for Word {
+    #[inline]
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        self.as_str().stable_hash(sequence_number, state)
+    }
+}
+
+impl stable_hash::StableHash for Word {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        self.as_str().stable_hash(field_address, state)
+    }
+}
+
+impl GasSizeOf for Word {
+    fn gas_size_of(&self) -> Gas {
+        self.0.len().saturating_into()
+    }
+}
+
+impl AsRef<str> for Word {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for Word {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<Word> for &str {
+    fn eq(&self, other: &Word) -> bool {
+        self == &other.as_str()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Entry {
     key: Option<Word>,
@@ -93,6 +135,10 @@ impl Entry {
 pub struct Object(Box<[Entry]>);
 
 impl Object {
+    pub fn empty() -> Object {
+        Object(Box::new([]))
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.0
             .iter()
@@ -118,18 +164,35 @@ impl Object {
         self.0.len()
     }
 
-    pub fn extend(&mut self, other: Object) {
+    /// Add the entries from an object to `self`. Note that if `self` and
+    /// `object` have entries with identical keys, the entry in `self` wins.
+    pub fn append(&mut self, other: Object) {
         let mut entries = std::mem::replace(&mut self.0, Box::new([])).into_vec();
         entries.extend(other.0.into_vec());
         self.0 = entries.into_boxed_slice();
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
-impl FromIterator<(String, Value)> for Object {
-    fn from_iter<T: IntoIterator<Item = (String, Value)>>(iter: T) -> Self {
+impl Extend<(Word, Value)> for Object {
+    /// Add the entries from the iterator to an object. Note that if the
+    /// iterator produces a key that is already set in the object, it will
+    /// not be overwritten, and the previous value wins.
+    fn extend<T: IntoIterator<Item = (Word, Value)>>(&mut self, iter: T) {
+        let mut entries = std::mem::replace(&mut self.0, Box::new([])).into_vec();
+        entries.extend(iter.into_iter().map(|(key, value)| Entry::new(key, value)));
+        self.0 = entries.into_boxed_slice();
+    }
+}
+
+impl FromIterator<(Word, Value)> for Object {
+    fn from_iter<T: IntoIterator<Item = (Word, Value)>>(iter: T) -> Self {
         let mut items: Vec<_> = Vec::new();
         for (key, value) in iter {
-            items.push(Entry::new(key.into(), value))
+            items.push(Entry::new(key, value))
         }
         Object(items.into_boxed_slice())
     }
@@ -212,11 +275,18 @@ impl CacheWeight for Object {
 
 impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        f.debug_map()
+            .entries(self.0.into_iter().map(|e| {
+                (
+                    e.key.as_ref().map(|w| w.as_str()).unwrap_or("---"),
+                    &e.value,
+                )
+            }))
+            .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -267,6 +337,8 @@ impl Value {
                     Err(Value::Int(num))
                 }
             }
+            ("Int8", Value::Int(num)) => Ok(Value::String(num.to_string())),
+            ("Int8", Value::String(num)) => Ok(Value::String(num)),
             ("String", Value::String(s)) => Ok(Value::String(s)),
             ("ID", Value::String(s)) => Ok(Value::String(s)),
             ("ID", Value::Int(n)) => Ok(Value::String(n.to_string())),
@@ -407,8 +479,10 @@ impl From<serde_json::Value> for Value {
                 Value::List(vals)
             }
             serde_json::Value::Object(map) => {
-                let obj =
-                    Object::from_iter(map.into_iter().map(|(key, val)| (key, Value::from(val))));
+                let obj = Object::from_iter(
+                    map.into_iter()
+                        .map(|(key, val)| (Word::from(key), Value::from(val))),
+                );
                 Value::Object(obj)
             }
         }
@@ -436,6 +510,21 @@ impl From<Value> for q::Value {
                 }
                 q::Value::Object(rmap)
             }
+        }
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(i) => f.debug_tuple("Int").field(i).finish(),
+            Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
+            Value::String(s) => write!(f, "{s:?}"),
+            Value::Boolean(b) => write!(f, "{b}"),
+            Value::Null => write!(f, "null"),
+            Value::Enum(e) => write!(f, "{e}"),
+            Value::List(l) => f.debug_list().entries(l).finish(),
+            Value::Object(o) => write!(f, "{o:?}"),
         }
     }
 }

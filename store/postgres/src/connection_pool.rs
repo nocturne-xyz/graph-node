@@ -7,10 +7,9 @@ use diesel::{
 use diesel::{sql_query, RunQueryDsl};
 
 use graph::cheap_clone::CheapClone;
-use graph::components::metrics::MetricsRegistryTrait;
 use graph::constraint_violation;
-use graph::prelude::tokio;
 use graph::prelude::tokio::time::Instant;
+use graph::prelude::{tokio, MetricsRegistry};
 use graph::slog::warn;
 use graph::util::timed_rw_lock::TimedMutex;
 use graph::{
@@ -55,10 +54,22 @@ impl ForeignServer {
         format!("shard_{}", shard.as_str())
     }
 
-    /// The name of the schema under which the `subgraphs` schema for `shard`
-    /// is accessible in shards that are not `shard`
+    /// The name of the schema under which the `subgraphs` schema for
+    /// `shard` is accessible in shards that are not `shard`. In most cases
+    /// you actually want to use `metadata_schema_in`
     pub fn metadata_schema(shard: &Shard) -> String {
         format!("{}_subgraphs", Self::name(shard))
+    }
+
+    /// The name of the schema under which the `subgraphs` schema for
+    /// `shard` is accessible in the shard `current`. It is permissible for
+    /// `shard` and `current` to be the same.
+    pub fn metadata_schema_in(shard: &Shard, current: &Shard) -> String {
+        if shard == current {
+            "subgraphs".to_string()
+        } else {
+            Self::metadata_schema(&shard)
+        }
     }
 
     pub fn new_from_raw(shard: String, postgres_url: &str) -> Result<Self, anyhow::Error> {
@@ -203,6 +214,8 @@ impl ForeignServer {
             "subgraph_deployment_assignment",
             "subgraph",
             "subgraph_version",
+            "subgraph_deployment",
+            "subgraph_manifest",
         ] {
             let create_stmt =
                 catalog::create_foreign_table(conn, "subgraphs", table_name, &nsp, &self.name)?;
@@ -310,7 +323,7 @@ impl ConnectionPool {
         pool_size: u32,
         fdw_pool_size: Option<u32>,
         logger: &Logger,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
         coord: Arc<PoolCoordinator>,
     ) -> ConnectionPool {
         let state_tracker = PoolStateTracker::new();
@@ -593,7 +606,7 @@ struct EventHandler {
 impl EventHandler {
     fn new(
         logger: Logger,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
         wait_stats: PoolWaitStats,
         const_labels: HashMap<String, String>,
         state_tracker: PoolStateTracker,
@@ -711,7 +724,7 @@ impl PoolInner {
         pool_size: u32,
         fdw_pool_size: Option<u32>,
         logger: &Logger,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
         state_tracker: PoolStateTracker,
     ) -> PoolInner {
         let logger_store = logger.new(o!("component" => "Store"));
@@ -998,13 +1011,7 @@ impl PoolInner {
         let result = pool
             .configure_fdw(coord.servers.as_ref())
             .and_then(|()| migrate_schema(&pool.logger, &conn))
-            .and_then(|had_migrations| {
-                if had_migrations {
-                    coord.propagate_schema_change(&self.shard)
-                } else {
-                    Ok(())
-                }
-            });
+            .and_then(|count| coord.propagate(&pool, count));
         debug!(&pool.logger, "Release migration lock");
         advisory_lock::unlock_migration(&conn).unwrap_or_else(|err| {
             die(&pool.logger, "failed to release migration lock", &err);
@@ -1094,12 +1101,31 @@ impl PoolInner {
 
 embed_migrations!("./migrations");
 
+struct MigrationCount {
+    old: usize,
+    new: usize,
+}
+
+impl MigrationCount {
+    fn new(old: usize, new: usize) -> Self {
+        Self { old, new }
+    }
+
+    fn had_migrations(&self) -> bool {
+        self.old != self.new
+    }
+
+    fn is_new(&self) -> bool {
+        self.old == 0
+    }
+}
+
 /// Run all schema migrations.
 ///
 /// When multiple `graph-node` processes start up at the same time, we ensure
 /// that they do not run migrations in parallel by using `blocking_conn` to
 /// serialize them. The `conn` is used to run the actual migration.
-fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<bool, StoreError> {
+fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<MigrationCount, StoreError> {
     // Collect migration logging output
     let mut output = vec![];
 
@@ -1109,7 +1135,7 @@ fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<bool, StoreErr
     let result = embedded_migrations::run_with_output(conn, &mut output);
     info!(logger, "Migrations finished");
 
-    let had_migrations = catalog::migration_count(conn)? != old_count;
+    let new_count = catalog::migration_count(conn)?;
 
     // If there was any migration output, log it now
     let msg = String::from_utf8(output).unwrap_or_else(|_| String::from("<unreadable>"));
@@ -1123,14 +1149,15 @@ fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<bool, StoreErr
             debug!(logger, "Postgres migration output"; "output" => msg);
         }
     }
+    let count = MigrationCount::new(old_count, new_count);
 
-    if had_migrations {
+    if count.had_migrations() {
         // Reset the query statistics since a schema change makes them not
         // all that useful. An error here is not serious and can be ignored.
         conn.batch_execute("select pg_stat_statements_reset()").ok();
     }
 
-    Ok(had_migrations)
+    Ok(count)
 }
 
 /// Helper to coordinate propagating schema changes from the database that
@@ -1157,7 +1184,7 @@ impl PoolCoordinator {
         postgres_url: String,
         pool_size: u32,
         fdw_pool_size: Option<u32>,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
     ) -> ConnectionPool {
         let is_writable = !pool_name.is_replica();
 
@@ -1194,18 +1221,23 @@ impl PoolCoordinator {
 
     /// Propagate changes to the schema in `shard` to all other pools. Those
     /// other pools will then recreate any tables that they imported from
-    /// `shard`
-    fn propagate_schema_change(&self, shard: &Shard) -> Result<(), StoreError> {
-        let server = self
-            .servers
-            .iter()
-            .find(|server| &server.shard == shard)
-            .ok_or_else(|| constraint_violation!("unknown shard {shard}"))?;
-
-        for pool in self.pools.lock().unwrap().values() {
-            if let Err(e) = pool.remap(server) {
-                error!(pool.logger, "Failed to map imports from {}", server.shard; "error" => e.to_string());
-                return Err(e);
+    /// `shard`. If `pool` is a new shard, we also map all other shards into
+    /// it.
+    fn propagate(&self, pool: &PoolInner, count: MigrationCount) -> Result<(), StoreError> {
+        // pool is a new shard, map all other shards into it
+        if count.is_new() {
+            for server in self.servers.iter() {
+                pool.remap(server)?;
+            }
+        }
+        // pool had schema changes, refresh the import from pool into all other shards
+        if count.had_migrations() {
+            let server = self.server(&pool.shard)?;
+            for pool in self.pools.lock().unwrap().values() {
+                if let Err(e) = pool.remap(server) {
+                    error!(pool.logger, "Failed to map imports from {}", server.shard; "error" => e.to_string());
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -1217,5 +1249,12 @@ impl PoolCoordinator {
 
     pub fn servers(&self) -> Arc<Vec<ForeignServer>> {
         self.servers.clone()
+    }
+
+    fn server(&self, shard: &Shard) -> Result<&ForeignServer, StoreError> {
+        self.servers
+            .iter()
+            .find(|server| &server.shard == shard)
+            .ok_or_else(|| constraint_violation!("unknown shard {shard}"))
     }
 }

@@ -10,6 +10,7 @@ use graph::data::subgraph::API_VERSION_0_0_7;
 use graph::prelude::ethabi::ParamType;
 use graph::prelude::ethabi::Token;
 use graph::prelude::tokio::try_join;
+use graph::slog::o;
 use graph::{
     blockchain::{block_stream::BlockWithTriggers, BlockPtr, IngestorError},
     prelude::{
@@ -60,8 +61,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct EthereumAdapter {
     logger: Logger,
-    url_hostname: Arc<String>,
-    /// The label for the provider from the configuration
     provider: String,
     web3: Arc<Web3<Transport>>,
     metrics: Arc<ProviderEthRpcMetrics>,
@@ -69,22 +68,11 @@ pub struct EthereumAdapter {
     call_only: bool,
 }
 
-/// Gas limit for `eth_call`. The value of 50_000_000 is a protocol-wide parameter so this
-/// should be changed only for debugging purposes and never on an indexer in the network. This
-/// value was chosen because it is the Geth default
-/// https://github.com/ethereum/go-ethereum/blob/e4b687cf462870538743b3218906940ae590e7fd/eth/ethconfig/config.go#L91.
-/// It is not safe to set something higher because Geth will silently override the gas limit
-/// with the default. This means that we do not support indexing against a Geth node with
-/// `RPCGasCap` set below 50 million.
-// See also f0af4ab0-6b7c-4b68-9141-5b79346a5f61.
-const ETH_CALL_GAS: u32 = 50_000_000;
-
 impl CheapClone for EthereumAdapter {
     fn cheap_clone(&self) -> Self {
         Self {
             logger: self.logger.clone(),
             provider: self.provider.clone(),
-            url_hostname: self.url_hostname.cheap_clone(),
             web3: self.web3.cheap_clone(),
             metrics: self.metrics.cheap_clone(),
             supports_eip_1898: self.supports_eip_1898,
@@ -101,19 +89,11 @@ impl EthereumAdapter {
     pub async fn new(
         logger: Logger,
         provider: String,
-        url: &str,
         transport: Transport,
         provider_metrics: Arc<ProviderEthRpcMetrics>,
         supports_eip_1898: bool,
         call_only: bool,
     ) -> Self {
-        // Unwrap: The transport was constructed with this url, so it is valid and has a host.
-        let hostname = graph::url::Url::parse(url)
-            .unwrap()
-            .host_str()
-            .unwrap()
-            .to_string();
-
         let web3 = Arc::new(Web3::new(transport));
 
         // Use the client version to check if it is ganache. For compatibility with unit tests, be
@@ -128,7 +108,6 @@ impl EthereumAdapter {
         EthereumAdapter {
             logger,
             provider,
-            url_hostname: Arc::new(hostname),
             web3,
             metrics: provider_metrics,
             supports_eip_1898: supports_eip_1898 && !is_ganache,
@@ -436,8 +415,10 @@ impl EthereumAdapter {
         contract_address: Address,
         call_data: Bytes,
         block_ptr: BlockPtr,
+        gas: Option<u32>,
     ) -> impl Future<Item = Bytes, Error = EthereumContractCallError> + Send {
         let web3 = self.web3.clone();
+        let logger = Logger::new(&logger, o!("provider" => self.provider.clone()));
 
         // Ganache does not support calls by block hash.
         // See https://github.com/trufflesuite/ganache-cli/issues/973
@@ -457,11 +438,10 @@ impl EthereumAdapter {
             .run(move || {
                 let call_data = call_data.clone();
                 let web3 = web3.cheap_clone();
-
                 async move {
                     let req = CallRequest {
                         to: Some(contract_address),
-                        gas: Some(web3::types::U256::from(ETH_CALL_GAS)),
+                        gas: gas.map(|val| web3::types::U256::from(val)),
                         data: Some(call_data.clone()),
                         from: None,
                         gas_price: None,
@@ -754,6 +734,75 @@ impl EthereumAdapter {
         )
     }
 
+    // Used to get the block triggers with a `polling` or `once` filter
+    /// `polling_filter_type` is used to differentiate between `polling` and `once` filters
+    /// A `polling_filter_type` value of  `BlockPollingFilterType::Once` is the case for
+    /// intialization triggers
+    /// A `polling_filter_type` value of  `BlockPollingFilterType::Polling` is the case for
+    /// polling triggers
+    pub(crate) fn blocks_matching_polling_intervals(
+        &self,
+        logger: Logger,
+        from: i32,
+        to: i32,
+        filter: &EthereumBlockFilter,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<EthereumTrigger>, anyhow::Error>>
+                + std::marker::Send,
+        >,
+    > {
+        // Create a HashMap of block numbers to Vec<EthereumBlockTriggerType>
+        let matching_blocks = (from..=to)
+            .filter_map(|block_number| {
+                filter
+                    .polling_intervals
+                    .iter()
+                    .find_map(|(start_block, interval)| {
+                        let has_once_trigger = (*interval == 0) && (block_number == *start_block);
+                        let has_polling_trigger =
+                            *interval > 0 && ((block_number - start_block) % *interval) == 0;
+
+                        if has_once_trigger || has_polling_trigger {
+                            let mut triggers = Vec::new();
+                            if has_once_trigger {
+                                triggers.push(EthereumBlockTriggerType::Start);
+                            }
+                            if has_polling_trigger {
+                                triggers.push(EthereumBlockTriggerType::End);
+                            }
+                            Some((block_number, triggers))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let blocks_matching_polling_filter = self.load_ptrs_for_blocks(
+            logger.clone(),
+            matching_blocks.iter().map(|(k, _)| *k).collect_vec(),
+        );
+
+        let block_futures = blocks_matching_polling_filter.map(move |ptrs| {
+            ptrs.into_iter()
+                .flat_map(|ptr| {
+                    let triggers = matching_blocks
+                        .get(&ptr.number)
+                        // Safe to unwrap since we are iterating over ptrs which was created from
+                        // the keys of matching_blocks
+                        .unwrap()
+                        .iter()
+                        .map(move |trigger| EthereumTrigger::Block(ptr.clone(), trigger.clone()));
+
+                    triggers
+                })
+                .collect::<Vec<_>>()
+        });
+
+        block_futures.compat().boxed()
+    }
+
     pub(crate) async fn calls_in_block(
         &self,
         logger: &Logger,
@@ -821,6 +870,17 @@ impl EthereumAdapter {
         )
     }
 
+    pub(crate) fn load_ptrs_for_blocks(
+        &self,
+        logger: Logger,
+        blocks: Vec<BlockNumber>,
+    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send> {
+        // Currently we can't go to the DB for this because there might be duplicate entries for
+        // the same block number.
+        debug!(&logger, "Requesting hashes for blocks {:?}", blocks);
+        Box::new(self.load_block_ptrs_rpc(logger, blocks).collect())
+    }
+
     pub async fn chain_id(&self) -> Result<u64, Error> {
         let logger = self.logger.clone();
         let web3 = self.web3.clone();
@@ -840,10 +900,6 @@ impl EthereumAdapter {
 
 #[async_trait]
 impl EthereumAdapterTrait for EthereumAdapter {
-    fn url_hostname(&self) -> &str {
-        &self.url_hostname
-    }
-
     fn provider(&self) -> &str {
         &self.provider
     }
@@ -1216,7 +1272,9 @@ impl EthereumAdapterTrait for EthereumAdapter {
 
         debug!(logger, "eth_call";
             "address" => hex::encode(call.address),
-            "data" => hex::encode(&call_data)
+            "data" => hex::encode(&call_data),
+            "block_hash" => call.block_ptr.hash_hex(),
+            "block_number" => call.block_ptr.block_number()
         );
 
         // Check if we have it cached, if not do the call and cache.
@@ -1240,6 +1298,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                             call.address,
                             Bytes(call_data.clone()),
                             call.block_ptr.clone(),
+                            call.gas,
                         )
                         .map(move |result| {
                             // Don't block handler execution on writing to the cache.
@@ -1358,6 +1417,30 @@ pub(crate) async fn blocks_with_triggers(
     let trigger_futs: FuturesUnordered<BoxFuture<Result<Vec<EthereumTrigger>, anyhow::Error>>> =
         FuturesUnordered::new();
 
+    // This is for `start` triggers which can be initialization handlers which needs to be run
+    // before all other triggers
+    if filter.block.trigger_every_block {
+        let block_future = eth
+            .block_range_to_ptrs(logger.clone(), from, to)
+            .map(move |ptrs| {
+                ptrs.into_iter()
+                    .flat_map(|ptr| {
+                        vec![
+                            EthereumTrigger::Block(ptr.clone(), EthereumBlockTriggerType::Start),
+                            EthereumTrigger::Block(ptr, EthereumBlockTriggerType::End),
+                        ]
+                    })
+                    .collect()
+            })
+            .compat()
+            .boxed();
+        trigger_futs.push(block_future)
+    } else if !filter.block.polling_intervals.is_empty() {
+        let block_futures_matching_once_filter =
+            eth.blocks_matching_polling_intervals(logger.clone(), from, to, &filter.block);
+        trigger_futs.push(block_futures_matching_once_filter);
+    }
+
     // Scan for Logs
     if !filter.log.is_empty() {
         let logs_future = get_logs_and_transactions(
@@ -1384,19 +1467,7 @@ pub(crate) async fn blocks_with_triggers(
         trigger_futs.push(calls_future)
     }
 
-    // Scan for Blocks
-    if filter.block.trigger_every_block {
-        let block_future = eth
-            .block_range_to_ptrs(logger.clone(), from, to)
-            .map(move |ptrs| {
-                ptrs.into_iter()
-                    .map(|ptr| EthereumTrigger::Block(ptr, EthereumBlockTriggerType::Every))
-                    .collect()
-            })
-            .compat()
-            .boxed();
-        trigger_futs.push(block_future)
-    } else if !filter.block.contract_addresses.is_empty() {
+    if !filter.block.contract_addresses.is_empty() {
         // To determine which blocks include a call to addresses
         // in the block filter, transform the `block_filter` into
         // a `call_filter` and run `blocks_with_calls`
@@ -1422,7 +1493,7 @@ pub(crate) async fn blocks_with_triggers(
             None => {
                 warn!(logger,
                       "Ethereum endpoint is behind";
-                      "url" => eth.url_hostname()
+                      "url" => eth.provider()
                 );
                 bail!("Block {} not found in the chain", to)
             }
@@ -1594,6 +1665,9 @@ pub(crate) fn parse_call_triggers(
     }
 }
 
+/// This method does not parse block triggers with `once` filters.
+/// This is because it is to be run before any other triggers are run.
+/// So we have `parse_initialization_triggers` for that.
 pub(crate) fn parse_block_triggers(
     block_filter: &EthereumBlockFilter,
     block: &EthereumBlockWithCalls,
@@ -1606,6 +1680,9 @@ pub(crate) fn parse_block_triggers(
     let trigger_every_block = block_filter.trigger_every_block;
     let call_filter = EthereumCallFilter::from(block_filter);
     let block_ptr2 = block_ptr.cheap_clone();
+    let block_ptr3 = block_ptr.cheap_clone();
+    let block_number = block_ptr.number;
+
     let mut triggers = match &block.calls {
         Some(calls) => calls
             .iter()
@@ -1621,9 +1698,45 @@ pub(crate) fn parse_block_triggers(
     };
     if trigger_every_block {
         triggers.push(EthereumTrigger::Block(
-            block_ptr,
-            EthereumBlockTriggerType::Every,
+            block_ptr.clone(),
+            EthereumBlockTriggerType::Start,
         ));
+        triggers.push(EthereumTrigger::Block(
+            block_ptr,
+            EthereumBlockTriggerType::End,
+        ));
+    } else if !block_filter.polling_intervals.is_empty() {
+        let has_polling_trigger =
+            &block_filter
+                .polling_intervals
+                .iter()
+                .any(|(start_block, interval)| match interval {
+                    0 => false,
+                    _ => (block_number - *start_block) % *interval == 0,
+                });
+
+        let has_once_trigger =
+            &block_filter
+                .polling_intervals
+                .iter()
+                .any(|(start_block, interval)| match interval {
+                    0 => block_number == *start_block,
+                    _ => false,
+                });
+
+        if *has_once_trigger {
+            triggers.push(EthereumTrigger::Block(
+                block_ptr3.clone(),
+                EthereumBlockTriggerType::Start,
+            ));
+        }
+
+        if *has_polling_trigger {
+            triggers.push(EthereumTrigger::Block(
+                block_ptr3,
+                EthereumBlockTriggerType::End,
+            ));
+        }
     }
     triggers
 }
@@ -2094,12 +2207,16 @@ mod tests {
         };
 
         assert_eq!(
-            vec![EthereumTrigger::Block(
-                BlockPtr::from((hash(2), 2)),
-                EthereumBlockTriggerType::Every
-            )],
+            vec![
+                EthereumTrigger::Block(
+                    BlockPtr::from((hash(2), 2)),
+                    EthereumBlockTriggerType::Start
+                ),
+                EthereumTrigger::Block(BlockPtr::from((hash(2), 2)), EthereumBlockTriggerType::End)
+            ],
             parse_block_triggers(
                 &EthereumBlockFilter {
+                    polling_intervals: HashSet::new(),
                     contract_addresses: HashSet::from_iter(vec![(10, address(1))]),
                     trigger_every_block: true,
                 },
@@ -2131,6 +2248,7 @@ mod tests {
             Vec::<EthereumTrigger>::new(),
             parse_block_triggers(
                 &EthereumBlockFilter {
+                    polling_intervals: HashSet::new(),
                     contract_addresses: HashSet::from_iter(vec![(1, address(1))]),
                     trigger_every_block: false,
                 },
@@ -2165,6 +2283,7 @@ mod tests {
             )],
             parse_block_triggers(
                 &EthereumBlockFilter {
+                    polling_intervals: HashSet::new(),
                     contract_addresses: HashSet::from_iter(vec![(1, address(4))]),
                     trigger_every_block: false,
                 },

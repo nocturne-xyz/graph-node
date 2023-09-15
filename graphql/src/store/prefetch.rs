@@ -1,39 +1,34 @@
 //! Run a GraphQL query and fetch all the entitied needed to build the
 //! final result
 
-use anyhow::{anyhow, Error};
 use graph::constraint_violation;
 use graph::data::query::Trace;
+use graph::data::store::{ID, PARENT_ID};
 use graph::data::value::{Object, Word};
-use graph::prelude::{r, CacheWeight, CheapClone};
+use graph::prelude::{r, CacheWeight, CheapClone, EntityQuery, EntityRange};
 use graph::slog::warn;
 use graph::util::cache_weight;
-use lazy_static::lazy_static;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use graph::schema::{ast as sast, ApiSchema};
 use graph::{components::store::EntityType, data::graphql::*};
 use graph::{
     data::graphql::ext::DirectiveFinder,
     prelude::{
-        s, ApiSchema, AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter,
-        EntityLink, EntityOrder, EntityWindow, ParentLink, QueryExecutionError, StoreError,
+        s, AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter, EntityLink,
+        EntityOrder, EntityWindow, ParentLink, QueryExecutionError, StoreError,
         Value as StoreValue, WindowAttribute, ENV_VARS,
     },
 };
 
 use crate::execution::{ast as a, ExecutionContext, Resolver};
 use crate::metrics::GraphQLMetrics;
-use crate::schema::ast as sast;
 use crate::store::query::build_query;
 use crate::store::StoreResolver;
 
-lazy_static! {
-    static ref ARG_FIRST: String = String::from("first");
-    static ref ARG_SKIP: String = String::from("skip");
-    static ref ARG_ID: String = String::from("id");
-}
+pub const ARG_ID: &str = "id";
 
 /// Intermediate data structure to hold the results of prefetching entities
 /// and their nested associations. For each association of `entity`, `children`
@@ -45,7 +40,7 @@ struct Node {
     /// the keys and values of the `children` map, but not of the map itself
     children_weight: usize,
 
-    entity: BTreeMap<Word, r::Value>,
+    entity: Object,
     /// We are using an `Rc` here for two reasons: it allows us to defer
     /// copying objects until the end, when converting to `q::Value` forces
     /// us to copy any child that is referenced by multiple parents. It also
@@ -89,8 +84,8 @@ struct Node {
     children: BTreeMap<Word, Vec<Rc<Node>>>,
 }
 
-impl From<BTreeMap<Word, r::Value>> for Node {
-    fn from(entity: BTreeMap<Word, r::Value>) -> Self {
+impl From<Object> for Node {
+    fn from(entity: Object) -> Self {
         Node {
             children_weight: entity.weight(),
             entity,
@@ -135,7 +130,7 @@ fn is_root_node<'a>(mut nodes: impl Iterator<Item = &'a Node>) -> bool {
 }
 
 fn make_root_node() -> Vec<Node> {
-    let entity = BTreeMap::new();
+    let entity = Object::empty();
     vec![Node {
         children_weight: entity.weight(),
         entity,
@@ -150,13 +145,14 @@ fn make_root_node() -> Vec<Node> {
 impl From<Node> for r::Value {
     fn from(node: Node) -> Self {
         let mut map = node.entity;
-        for (key, nodes) in node.children.into_iter() {
-            map.insert(
+        let entries = node.children.into_iter().map(|(key, nodes)| {
+            (
                 format!("prefetch:{}", key).into(),
                 node_list_as_value(nodes),
-            );
-        }
-        r::Value::object(map)
+            )
+        });
+        map.extend(entries);
+        r::Value::Object(map)
     }
 }
 
@@ -174,16 +170,16 @@ impl ValueExt for r::Value {
 }
 
 impl Node {
-    fn id(&self) -> Result<String, Error> {
+    fn id(&self) -> Result<String, QueryExecutionError> {
         match self.get("id") {
-            None => Err(anyhow!("Entity is missing an `id` attribute")),
+            None => Err(QueryExecutionError::IdMissing),
             Some(r::Value::String(s)) => Ok(s.clone()),
-            _ => Err(anyhow!("Entity has non-string `id` attribute")),
+            _ => Err(QueryExecutionError::IdNotString),
         }
     }
 
     fn get(&self, key: &str) -> Option<&r::Value> {
-        self.entity.get(&key.into())
+        self.entity.get(key)
     }
 
     fn typename(&self) -> &str {
@@ -299,10 +295,12 @@ impl<'a> JoinCond<'a> {
                         // those and the parent ids
                         let (ids, child_ids): (Vec<_>, Vec<_>) = parents_by_id
                             .into_iter()
-                            .filter_map(|(id, node)| {
-                                node.get(child_field)
-                                    .and_then(|value| value.as_str())
-                                    .map(|child_id| (id, child_id.to_owned()))
+                            .map(|(id, node)| {
+                                (
+                                    id,
+                                    node.get(child_field)
+                                        .and_then(|value| value.as_str().map(|s| s.to_string())),
+                                )
                             })
                             .unzip();
 
@@ -314,25 +312,28 @@ impl<'a> JoinCond<'a> {
                         // parent ids
                         let (ids, child_ids): (Vec<_>, Vec<_>) = parents_by_id
                             .into_iter()
-                            .filter_map(|(id, node)| {
-                                node.get(child_field)
-                                    .and_then(|value| match value {
-                                        r::Value::List(values) => {
-                                            let values: Vec<_> = values
-                                                .iter()
-                                                .filter_map(|value| {
-                                                    value.as_str().map(|value| value.to_owned())
-                                                })
-                                                .collect();
-                                            if values.is_empty() {
-                                                None
-                                            } else {
-                                                Some(values)
+                            .map(|(id, node)| {
+                                (
+                                    id,
+                                    node.get(child_field)
+                                        .and_then(|value| match value {
+                                            r::Value::List(values) => {
+                                                let values: Vec<_> = values
+                                                    .iter()
+                                                    .filter_map(|value| {
+                                                        value.as_str().map(|value| value.to_owned())
+                                                    })
+                                                    .collect();
+                                                if values.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(values)
+                                                }
                                             }
-                                        }
-                                        _ => None,
-                                    })
-                                    .map(|child_ids| (id, child_ids))
+                                            _ => None,
+                                        })
+                                        .unwrap_or(Vec::new()),
+                                )
                             })
                             .unzip();
                         (ids, ParentLink::List(child_ids))
@@ -400,7 +401,7 @@ impl<'a> Join<'a> {
         let mut grouped: BTreeMap<&str, Vec<Rc<Node>>> = BTreeMap::default();
         for child in children.iter() {
             match child
-                .get("g$parent_id")
+                .get(&*PARENT_ID)
                 .expect("the query that produces 'child' ensures there is always a g$parent_id")
             {
                 r::Value::String(key) => grouped.entry(key).or_default().push(child.clone()),
@@ -485,9 +486,12 @@ pub fn run(
     execute_root_selection_set(resolver, ctx, selection_set).map(|(nodes, trace)| {
         graphql_metrics.observe_query_result_size(nodes.weight());
         let obj = Object::from_iter(nodes.into_iter().flat_map(|node| {
-            node.children
-                .into_iter()
-                .map(|(key, nodes)| (format!("prefetch:{}", key), node_list_as_value(nodes)))
+            node.children.into_iter().map(|(key, nodes)| {
+                (
+                    Word::from(format!("prefetch:{}", key)),
+                    node_list_as_value(nodes),
+                )
+            })
         }));
         (r::Value::Object(obj), trace)
     })
@@ -653,6 +657,30 @@ fn execute_field(
     .map_err(|e| vec![e])
 }
 
+/// Check whether `field` only selects the `id` of its children and whether
+/// it is safe to skip running `query` if we have all child ids in memory
+/// already.
+fn selects_id_only(field: &a::Field, query: &EntityQuery) -> bool {
+    if query.filter.is_some() || query.range.skip != 0 {
+        return false;
+    }
+    match &query.order {
+        EntityOrder::Ascending(attr, _) => {
+            if attr != ID.as_str() {
+                return false;
+            }
+        }
+        _ => {
+            return false;
+        }
+    }
+    field
+        .selection_set
+        .single_field()
+        .map(|field| field.name.as_str() == ID.as_str())
+        .unwrap_or(false)
+}
+
 /// Query child entities for `parents` from the store. The `join` indicates
 /// in which child field to look for the parent's id/join field. When
 /// `is_single` is `true`, there is at most one child per parent.
@@ -685,7 +713,7 @@ fn fetch(
     }
 
     query.logger = Some(ctx.logger.cheap_clone());
-    if let Some(r::Value::String(id)) = field.argument_value(ARG_ID.as_str()) {
+    if let Some(r::Value::String(id)) = field.argument_value(ARG_ID) {
         query.filter = Some(
             EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.clone()))
                 .and_maybe(query.filter),
@@ -699,17 +727,33 @@ fn fetch(
         if windows.is_empty() {
             return Ok((vec![], Trace::None));
         }
+        // See if we can short-circuit query execution and just reuse what
+        // we already have in memory. We could do this probably even with
+        // multiple windows, but this covers the most common case.
+        if !ENV_VARS.store.disable_child_optimization
+            && windows.len() == 1
+            && windows[0].link.has_child_ids()
+            && selects_id_only(field, &query)
+        {
+            let mut windows = windows;
+            // unwrap: we checked that len is 1
+            let window = windows.pop().unwrap();
+            let parent_ids = parents
+                .iter()
+                .map(|parent| parent.id())
+                .collect::<Result<_, _>>()
+                .map_err(QueryExecutionError::from)?;
+            // unwrap: we checked in the if condition that the window has child ids
+            let first = query.range.first.unwrap_or(EntityRange::FIRST) as usize;
+            let objs = window.link.to_basic_objects(&parent_ids, first).unwrap();
+            return Ok((objs.into_iter().map(Node::from).collect(), Trace::None));
+        }
         query.collection = EntityCollection::Window(windows);
     }
     resolver
         .store
         .find_query_values(query)
-        .map(|(values, trace)| {
-            (
-                values.into_iter().map(|entity| entity.into()).collect(),
-                trace,
-            )
-        })
+        .map(|(values, trace)| (values.into_iter().map(Node::from).collect(), trace))
 }
 
 #[derive(Debug, Default, Clone)]

@@ -18,7 +18,7 @@ mod types;
 use crate::{
     cheap_clone::CheapClone,
     components::store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
-    data::subgraph::UnifiedMappingApiVersion,
+    data::subgraph::{UnifiedMappingApiVersion, MIN_SPEC_VERSION},
     data_source,
     prelude::DataSourceContext,
     runtime::{gas::GasCounter, AscHeap, HostExportError},
@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use slog::Logger;
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Debug},
     str::FromStr,
     sync::Arc,
@@ -167,7 +167,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
 
     /// Decoded trigger ready to be processed by the mapping.
     /// New implementations should have this be the same as `TriggerData`.
-    type MappingTrigger: Send + Sync + Debug;
+    type MappingTrigger: MappingTriggerTrait + Send + Sync + Debug;
 
     /// Trigger filter used as input to the triggers adapter.
     type TriggerFilter: TriggerFilter<Self>;
@@ -270,7 +270,12 @@ pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
     fn context(&self) -> Arc<Option<DataSourceContext>>;
     fn creation_block(&self) -> Option<BlockNumber>;
     fn api_version(&self) -> semver::Version;
+    fn min_spec_version(&self) -> semver::Version {
+        MIN_SPEC_VERSION
+    }
     fn runtime(&self) -> Option<Arc<Vec<u8>>>;
+
+    fn handler_kinds(&self) -> HashSet<&str>;
 
     /// Checks if `trigger` matches this data source, and if so decodes it into a `MappingTrigger`.
     /// A return of `Ok(None)` mean the trigger does not match.
@@ -315,6 +320,7 @@ pub trait DataSourceTemplate<C: Blockchain>: Send + Sync + Debug {
     fn runtime(&self) -> Option<Arc<Vec<u8>>>;
     fn name(&self) -> &str;
     fn manifest_idx(&self) -> u32;
+    fn kind(&self) -> &str;
 }
 
 #[async_trait]
@@ -330,6 +336,20 @@ pub trait UnresolvedDataSource<C: Blockchain>:
 }
 
 pub trait TriggerData {
+    /// If there is an error when processing this trigger, this will called to add relevant context.
+    /// For example an useful return is: `"block #<N> (<hash>), transaction <tx_hash>".
+    fn error_context(&self) -> String;
+
+    /// If this trigger can only possibly match data sources with a specific address, then it can be
+    /// returned here for improved trigger matching performance, which helps subgraphs with many
+    /// data sources. But this optimization is not required, so returning `None` is always correct.
+    ///
+    /// When this does return `Some`, make sure that the `DataSource::address` of matching data
+    /// sources is equal to the addresssed returned here.
+    fn address_match(&self) -> Option<&[u8]>;
+}
+
+pub trait MappingTriggerTrait {
     /// If there is an error when processing this trigger, this will called to add relevant context.
     /// For example an useful return is: `"block #<N> (<hash>), transaction <tx_hash>".
     fn error_context(&self) -> String;

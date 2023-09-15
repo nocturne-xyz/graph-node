@@ -30,6 +30,7 @@ export enum ValueKind {
   NULL = 5,
   BYTES = 6,
   BIG_INT = 7,
+  INT8 = 8
 }
 // Big enough to fit any pointer or native `this.data`.
 export type Payload = u64
@@ -72,12 +73,12 @@ export class Value {
   }
 
   toBigInt(): BigInt {
-    assert(this.kind == ValueKind.BIGINT, 'Value is not a BigInt.')
+    assert(this.kind == ValueKind.BIG_INT, 'Value is not a BigInt.')
     return changetype<BigInt>(this.data as u32)
   }
 
   toBigDecimal(): BigDecimal {
-    assert(this.kind == ValueKind.BIGDECIMAL, 'Value is not a BigDecimal.')
+    assert(this.kind == ValueKind.BIG_DECIMAL, 'Value is not a BigDecimal.')
     return changetype<BigDecimal>(this.data as u32)
   }
 
@@ -197,8 +198,8 @@ export class Value {
 
   static fromBigInt(n: BigInt): Value {
     let value = new Value()
-    value.kind = ValueKind.BIGINT
-    value.data = n as u64
+    value.kind = ValueKind.BIG_INT
+    value.data = changetype<u32>(n) as u64
     return value
   }
 

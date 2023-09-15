@@ -3,9 +3,8 @@ use hyper::{Body, Client, Request};
 use std::time::Duration;
 
 use graph::data::{
-    graphql::effort::LoadManager,
     query::{QueryResults, QueryTarget},
-    value::Object,
+    value::{Object, Word},
 };
 use graph::prelude::*;
 
@@ -56,15 +55,11 @@ impl GraphQlRunner for TestGraphQlRunner {
                 == &r::Value::String(String::from("John"))
         {
             Object::from_iter(
-                vec![(String::from("name"), r::Value::String(String::from("John")))].into_iter(),
+                vec![(Word::from("name"), r::Value::String(String::from("John")))].into_iter(),
             )
         } else {
             Object::from_iter(
-                vec![(
-                    String::from("name"),
-                    r::Value::String(String::from("Jordi")),
-                )]
-                .into_iter(),
+                vec![(Word::from("name"), r::Value::String(String::from("Jordi")))].into_iter(),
             )
         }
         .into()
@@ -78,10 +73,6 @@ impl GraphQlRunner for TestGraphQlRunner {
         unreachable!();
     }
 
-    fn load_manager(&self) -> Arc<LoadManager> {
-        unimplemented!()
-    }
-
     fn metrics(&self) -> Arc<dyn GraphQLMetrics> {
         Arc::new(TestGraphQLMetrics)
     }
@@ -89,6 +80,8 @@ impl GraphQlRunner for TestGraphQlRunner {
 
 #[cfg(test)]
 mod test {
+    use http::header::CONTENT_TYPE;
+
     use super::*;
 
     lazy_static! {
@@ -118,7 +111,7 @@ mod test {
                         // Send an empty JSON POST request
                         let client = Client::new();
                         let request =
-                            Request::post(format!("http://localhost:8007/subgraphs/id/{}", id))
+                            Request::post(format!("http://localhost:8007/subgraphs/id/{}", id)).header(CONTENT_TYPE, "text/plain")
                                 .body(Body::from("{}"))
                                 .unwrap();
 
@@ -132,7 +125,7 @@ mod test {
                         let message = errors[0]
                             .as_str()
                             .expect("Error message is not a string");
-                        assert_eq!(message, "GraphQL server error (client error): The \"query\" field is missing in request data");
+                        assert_eq!(message, "{\"error\":\"GraphQL server error (client error): The \\\"query\\\" field is missing in request data\"}");
                     }).await.unwrap()
             })
     }
@@ -161,6 +154,7 @@ mod test {
                     let client = Client::new();
                     let request =
                         Request::post(format!("http://localhost:8002/subgraphs/id/{}", id))
+                            .header(CONTENT_TYPE, "text/plain")
                             .body(Body::from("{\"query\": \"<L<G<>M>\"}"))
                             .unwrap();
 
@@ -242,6 +236,7 @@ mod test {
                     let client = Client::new();
                     let request =
                         Request::post(format!("http://localhost:8003/subgraphs/id/{}", id))
+                            .header(CONTENT_TYPE, "plain/text")
                             .body(Body::from("{\"query\": \"{ name }\"}"))
                             .unwrap();
 

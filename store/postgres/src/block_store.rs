@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    iter::FromIterator,
+    collections::HashMap,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -8,20 +7,18 @@ use std::{
 use graph::{
     blockchain::ChainIdentifier,
     components::store::BlockStore as BlockStoreTrait,
-    prelude::{error, warn, BlockNumber, BlockPtr, Logger, ENV_VARS},
+    prelude::{error, info, warn, BlockNumber, BlockPtr, Logger, ENV_VARS},
 };
-use graph::{
-    constraint_violation,
-    prelude::{anyhow, CheapClone},
-};
+use graph::{constraint_violation, prelude::CheapClone};
 use graph::{
     prelude::{tokio, StoreError},
     util::timed_cache::TimedCache,
 };
 
 use crate::{
-    chain_head_listener::ChainHeadUpdateSender, connection_pool::ConnectionPool,
-    primary::Mirror as PrimaryMirror, ChainStore, NotificationSender, Shard, PRIMARY_SHARD,
+    chain_head_listener::ChainHeadUpdateSender, chain_store::ChainStoreMetrics,
+    connection_pool::ConnectionPool, primary::Mirror as PrimaryMirror, ChainStore,
+    NotificationSender, Shard, PRIMARY_SHARD,
 };
 
 #[cfg(debug_assertions)]
@@ -183,6 +180,7 @@ pub struct BlockStore {
     sender: Arc<NotificationSender>,
     mirror: PrimaryMirror,
     chain_head_cache: TimedCache<String, HashMap<String, BlockPtr>>,
+    chain_store_metrics: Arc<ChainStoreMetrics>,
 }
 
 impl BlockStore {
@@ -200,10 +198,11 @@ impl BlockStore {
     pub fn new(
         logger: Logger,
         // (network, ident, shard)
-        chains: Vec<(String, Vec<ChainIdentifier>, Shard)>,
+        chains: Vec<(String, ChainIdentifier, Shard)>,
         // shard -> pool
         pools: HashMap<Shard, ConnectionPool>,
         sender: Arc<NotificationSender>,
+        chain_store_metrics: Arc<ChainStoreMetrics>,
     ) -> Result<Self, StoreError> {
         // Cache chain head pointers for this long when returning
         // information from `chain_head_pointers`
@@ -220,24 +219,8 @@ impl BlockStore {
             sender,
             mirror,
             chain_head_cache,
+            chain_store_metrics,
         };
-
-        fn reduce_idents(
-            chain_name: &str,
-            idents: Vec<ChainIdentifier>,
-        ) -> Result<Option<ChainIdentifier>, StoreError> {
-            let mut idents: HashSet<ChainIdentifier> = HashSet::from_iter(idents.into_iter());
-            match idents.len() {
-                0 => Ok(None),
-                1 => Ok(idents.drain().next()),
-                _ => Err(anyhow!(
-                    "conflicting network identifiers for chain {}: {:?}",
-                    chain_name,
-                    idents
-                )
-                .into()),
-            }
-        }
 
         /// Check that the configuration for `chain` hasn't changed so that
         /// it is ok to ingest from it
@@ -245,7 +228,7 @@ impl BlockStore {
             logger: &Logger,
             chain: &primary::Chain,
             shard: &Shard,
-            ident: &Option<ChainIdentifier>,
+            ident: &ChainIdentifier,
         ) -> bool {
             if &chain.shard != shard {
                 error!(
@@ -257,45 +240,42 @@ impl BlockStore {
                 );
                 return false;
             }
-            match ident {
-                Some(ident) => {
-                    if chain.net_version != ident.net_version {
-                        error!(logger,
+            if chain.net_version != ident.net_version {
+                if chain.net_version == "0" {
+                    warn!(logger,
+                        "the net version for chain {} has changed from 0 to {} since the last time we ran, ignoring difference because 0 means UNSET and firehose does not provide it",
+                        chain.name,
+                        ident.net_version,
+                        )
+                } else {
+                    error!(logger,
                         "the net version for chain {} has changed from {} to {} since the last time we ran",
                         chain.name,
                         chain.net_version,
                         ident.net_version
                     );
-                        return false;
-                    }
-                    if chain.genesis_block != ident.genesis_block_hash.hash_hex() {
-                        error!(logger,
+                    return false;
+                }
+            }
+            if chain.genesis_block != ident.genesis_block_hash.hash_hex() {
+                error!(logger,
                         "the genesis block hash for chain {} has changed from {} to {} since the last time we ran",
                         chain.name,
                         chain.genesis_block,
                         ident.genesis_block_hash
                     );
-                        return false;
-                    }
-                    true
-                }
-                None => {
-                    warn!(logger, "Failed to get net version and genesis hash from provider. Assuming it has not changed");
-                    true
-                }
+                return false;
             }
+            true
         }
 
         // For each configured chain, add a chain store
-        for (chain_name, idents, shard) in chains {
-            let ident = reduce_idents(&chain_name, idents)?;
-            match (
-                existing_chains
-                    .iter()
-                    .find(|chain| chain.name == chain_name),
-                ident,
-            ) {
-                (Some(chain), ident) => {
+        for (chain_name, ident, shard) in chains {
+            match existing_chains
+                .iter()
+                .find(|chain| chain.name == chain_name)
+            {
+                Some(chain) => {
                     let status = if chain_ingestible(&block_store.logger, chain, &shard, &ident) {
                         ChainStatus::Ingestible
                     } else {
@@ -303,7 +283,7 @@ impl BlockStore {
                     };
                     block_store.add_chain_store(chain, status, false)?;
                 }
-                (None, Some(ident)) => {
+                None => {
                     let chain = primary::add_chain(
                         block_store.mirror.primary(),
                         &chain_name,
@@ -311,13 +291,6 @@ impl BlockStore {
                         &shard,
                     )?;
                     block_store.add_chain_store(&chain, ChainStatus::Ingestible, true)?;
-                }
-                (None, None) => {
-                    error!(
-                        &block_store.logger,
-                        " the chain {} is new but we could not get a network identifier for it",
-                        chain_name
-                    );
                 }
             };
         }
@@ -373,6 +346,7 @@ impl BlockStore {
             sender,
             pool,
             ENV_VARS.store.recent_blocks_cache_capacity,
+            self.chain_store_metrics.clone(),
         );
         if create {
             store.create(&ident)?;
@@ -465,6 +439,44 @@ impl BlockStore {
 
         self.stores.write().unwrap().remove(chain);
 
+        Ok(())
+    }
+
+    // cleanup_ethereum_shallow_blocks will delete cached blocks previously produced by firehose on
+    // an ethereum chain that is not currently configured to use firehose provider.
+    //
+    // This is to prevent an issue where firehose stores "shallow" blocks (with null data) in `chainX.blocks`
+    // table but RPC provider requires those blocks to be full.
+    //
+    // - This issue only affects ethereum chains.
+    // - This issue only happens when switching providers from firehose back to RPC. it is gated by
+    // the presence of a cursor in the public.ethereum_networks table for a chain configured without firehose.
+    // - Only the shallow blocks close to HEAD need to be deleted, the older blocks don't need data.
+    // - Deleting everything or creating an index on empty data would cause too much performance
+    // hit on graph-node startup.
+    //
+    // Discussed here: https://github.com/graphprotocol/graph-node/pull/4790
+    pub fn cleanup_ethereum_shallow_blocks(
+        &self,
+        ethereum_networks: Vec<&String>,
+        firehose_only_networks: Option<Vec<&String>>,
+    ) -> Result<(), StoreError> {
+        for store in self.stores.read().unwrap().values() {
+            if !ethereum_networks.contains(&&store.chain) {
+                continue;
+            };
+            if let Some(fh_nets) = firehose_only_networks.clone() {
+                if fh_nets.contains(&&store.chain) {
+                    continue;
+                };
+            }
+
+            if let Some(head_block) = store.remove_cursor(&&store.chain)? {
+                let lower_bound = head_block.saturating_sub(ENV_VARS.reorg_threshold * 2);
+                info!(&self.logger, "Removed cursor for non-firehose chain, now cleaning shallow blocks"; "network" => &store.chain, "lower_bound" => lower_bound);
+                store.cleanup_shallow_blocks(lower_bound)?;
+            }
+        }
         Ok(())
     }
 

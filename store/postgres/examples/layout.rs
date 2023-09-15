@@ -2,11 +2,12 @@ extern crate clap;
 extern crate graph_store_postgres;
 
 use clap::{arg, Command};
+use graph::schema::InputSchema;
 use std::collections::BTreeSet;
 use std::process::exit;
 use std::{fs, sync::Arc};
 
-use graph::prelude::{DeploymentHash, Schema};
+use graph::prelude::DeploymentHash;
 use graph_store_postgres::{
     command_support::{Catalog, Column, ColumnType, Layout, Namespace},
     layout_for_tests::make_dummy_site,
@@ -52,6 +53,7 @@ fn print_diesel_tables(layout: &Layout) {
             ColumnType::BigDecimal | ColumnType::BigInt => "Numeric",
             ColumnType::Bytes => "Binary",
             ColumnType::Int => "Integer",
+            ColumnType::Int8 => "Int8",
             ColumnType::String | ColumnType::Enum(_) | ColumnType::TSVector(_) => "Text",
         }
         .to_owned();
@@ -71,6 +73,7 @@ fn print_diesel_tables(layout: &Layout) {
             ColumnType::BigDecimal | ColumnType::BigInt => "BigDecimal",
             ColumnType::Bytes => "Vec<u8>",
             ColumnType::Int => "i32",
+            ColumnType::Int8 => "i64",
             ColumnType::String | ColumnType::Enum(_) | ColumnType::TSVector(_) => "String",
         }
         .to_owned();
@@ -137,7 +140,7 @@ pub fn main() {
     let subgraph = DeploymentHash::new("Qmasubgraph").unwrap();
     let schema = ensure(fs::read_to_string(schema), "Can not read schema file");
     let schema = ensure(
-        Schema::parse(&schema, subgraph.clone()),
+        InputSchema::parse(&schema, subgraph.clone()),
         "Failed to parse schema",
     );
     let namespace = ensure(

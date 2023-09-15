@@ -2,13 +2,14 @@ use clap::{Parser, Subcommand};
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
 use graph::bail;
+use graph::endpoint::EndpointMetrics;
+use graph::log::logger_with_levels;
 use graph::prelude::{MetricsRegistry, BLOCK_NUMBER_MAX};
-use graph::{data::graphql::effort::LoadManager, prelude::chrono, prometheus::Registry};
+use graph::{data::graphql::load_manager::LoadManager, prelude::chrono, prometheus::Registry};
 use graph::{
-    log::logger,
     prelude::{
         anyhow::{self, Context as AnyhowContextTrait},
-        info, o, slog, tokio, Logger, NodeId, ENV_VARS,
+        info, tokio, Logger, NodeId,
     },
     url::Url,
 };
@@ -30,6 +31,7 @@ use graph_store_postgres::{
     SubscriptionManager, PRIMARY_SHARD,
 };
 use lazy_static::lazy_static;
+use std::collections::BTreeMap;
 use std::{collections::HashMap, env, num::ParseIntError, sync::Arc, time::Duration};
 const VERSION_LABEL_KEY: &str = "version";
 
@@ -47,6 +49,13 @@ lazy_static! {
     version = RENDERED_TESTAMENT.as_str()
 )]
 pub struct Opt {
+    #[clap(
+        long,
+        default_value = "off",
+        env = "GRAPHMAN_LOG",
+        help = "level for log output in slog format"
+    )]
+    pub log_level: String,
     #[clap(
         long,
         default_value = "auto",
@@ -76,6 +85,14 @@ pub struct Opt {
         help = "HTTP addresses of IPFS nodes\n"
     )]
     pub ipfs: Vec<String>,
+    #[clap(
+        long,
+        value_name = "{HOST:PORT|URL}",
+        default_value = "https://arweave.net",
+        env = "GRAPH_NODE_ARWEAVE_URL",
+        help = "HTTP base URL for arweave gateway"
+    )]
+    pub arweave: String,
     #[clap(
         long,
         default_value = "3",
@@ -150,25 +167,64 @@ pub enum Command {
         /// The deployment (see `help info`)
         deployment: DeploymentSearch,
     },
+    /// Pause a deployment
+    Pause {
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
+    },
+    /// Resume a deployment
+    Resume {
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
+    },
+    /// Pause and resume a deployment
+    Restart {
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
+        /// Sleep for this many seconds after pausing subgraphs
+        #[clap(
+            long,
+            short,
+            default_value = "20",
+            parse(try_from_str = parse_duration_in_secs)
+        )]
+        sleep: Duration,
+    },
     /// Rewind a subgraph to a specific block
     Rewind {
         /// Force rewinding even if the block hash is not found in the local
         /// database
         #[clap(long, short)]
         force: bool,
+        /// Rewind to the start block of the subgraph
+        #[clap(long)]
+        start_block: bool,
         /// Sleep for this many seconds after pausing subgraphs
         #[clap(
             long,
             short,
-            default_value = "10",
+            default_value = "20",
             parse(try_from_str = parse_duration_in_secs)
         )]
         sleep: Duration,
         /// The block hash of the target block
-        block_hash: String,
+        #[clap(
+            required_unless_present = "start-block",
+            conflicts_with = "start-block",
+            long,
+            short = 'H'
+        )]
+        block_hash: Option<String>,
         /// The block number of the target block
-        block_number: i32,
+        #[clap(
+            required_unless_present = "start-block",
+            conflicts_with = "start-block",
+            long,
+            short = 'n'
+        )]
+        block_number: Option<i32>,
         /// The deployments to rewind (see `help info`)
+        #[clap(required = true, min_values = 1)]
         deployments: Vec<DeploymentSearch>,
     },
     /// Deploy and run an arbitrary subgraph up to a certain block
@@ -233,16 +289,33 @@ pub enum Command {
     #[clap(subcommand)]
     Index(IndexCommand),
 
-    /// Prune deployments
+    /// Prune a deployment
+    ///
+    /// Keep only entity versions that are needed to respond to queries at
+    /// block heights that are within `history` blocks of the subgraph head;
+    /// all other entity versions are removed.
+    ///
+    /// Unless `--once` is given, this setting is permanent and the subgraph
+    /// will periodically be pruned to remove history as the subgraph head
+    /// moves forward.
     Prune {
         /// The deployment to prune (see `help info`)
         deployment: DeploymentSearch,
-        /// Prune tables with a ratio of entities to entity versions lower than this
-        #[clap(long, short, default_value = "0.20")]
-        prune_ratio: f64,
+        /// Prune by rebuilding tables when removing more than this fraction
+        /// of history. Defaults to GRAPH_STORE_HISTORY_REBUILD_THRESHOLD
+        #[clap(long, short)]
+        rebuild_threshold: Option<f64>,
+        /// Prune by deleting when removing more than this fraction of
+        /// history but less than rebuild_threshold. Defaults to
+        /// GRAPH_STORE_HISTORY_DELETE_THRESHOLD
+        #[clap(long, short)]
+        delete_threshold: Option<f64>,
         /// How much history to keep in blocks
         #[clap(long, short = 'y', default_value = "10000")]
         history: usize,
+        /// Prune only this once
+        #[clap(long, short)]
+        once: bool,
     },
 
     /// General database management
@@ -341,6 +414,15 @@ pub enum ConfigCommand {
         #[clap(short, long, default_value = "")]
         features: String,
         network: String,
+    },
+    /// Show subgraph-specific settings
+    ///
+    /// GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS can add a file that contains
+    /// subgraph-specific settings. This command determines which settings
+    /// would apply when a subgraph <name> is deployed and prints the result
+    Setting {
+        /// The subgraph name for which to print settings
+        name: String,
     },
 }
 
@@ -582,6 +664,10 @@ pub enum IndexCommand {
             possible_values = &["btree", "hash", "gist", "spgist", "gin", "brin"]
         )]
         method: String,
+
+        #[clap(long)]
+        /// Specifies a starting block number for creating a partial index.
+        after: Option<i32>,
     },
     /// Lists existing indexes for a given Entity
     List {
@@ -700,6 +786,7 @@ struct Context {
     node_id: NodeId,
     config: Cfg,
     ipfs_url: Vec<String>,
+    arweave_url: String,
     fork_base: Option<Url>,
     registry: Arc<MetricsRegistry>,
     pub prometheus_registry: Arc<Registry>,
@@ -711,6 +798,7 @@ impl Context {
         node_id: NodeId,
         config: Cfg,
         ipfs_url: Vec<String>,
+        arweave_url: String,
         fork_base: Option<Url>,
         version_label: Option<String>,
     ) -> Self {
@@ -738,6 +826,7 @@ impl Context {
             fork_base,
             registry,
             prometheus_registry,
+            arweave_url,
         }
     }
 
@@ -820,7 +909,7 @@ impl Context {
             &self.node_id,
             &self.config,
             self.fork_base,
-            self.registry,
+            self.registry.clone(),
         );
 
         for pool in pools.values() {
@@ -832,7 +921,8 @@ impl Context {
             pools.clone(),
             subgraph_store,
             HashMap::default(),
-            vec![],
+            BTreeMap::new(),
+            self.registry,
         );
 
         (store, pools)
@@ -858,7 +948,7 @@ impl Context {
         let store = self.store();
 
         let subscription_manager = Arc::new(PanicSubscriptionManager);
-        let load_manager = Arc::new(LoadManager::new(&logger, vec![], registry.clone()));
+        let load_manager = Arc::new(LoadManager::new(&logger, vec![], vec![], registry.clone()));
 
         Arc::new(GraphQlRunner::new(
             &logger,
@@ -872,7 +962,8 @@ impl Context {
     async fn ethereum_networks(&self) -> anyhow::Result<EthereumNetworks> {
         let logger = self.logger.clone();
         let registry = self.metrics_registry();
-        create_all_ethereum_networks(logger, registry, &self.config).await
+        let metrics = Arc::new(EndpointMetrics::mock());
+        create_all_ethereum_networks(logger, registry, &self.config, metrics).await
     }
 
     fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
@@ -909,10 +1000,7 @@ async fn main() -> anyhow::Result<()> {
 
     let version_label = opt.version_label.clone();
     // Set up logger
-    let logger = match ENV_VARS.log_levels {
-        Some(_) => logger(false),
-        None => Logger::root(slog::Discard, o!()),
-    };
+    let logger = logger_with_levels(false, Some(&opt.log_level));
 
     // Log version information
     info!(
@@ -968,6 +1056,7 @@ async fn main() -> anyhow::Result<()> {
         node,
         config,
         opt.ipfs,
+        opt.arweave,
         fork_base,
         version_label.clone(),
     );
@@ -1039,6 +1128,7 @@ async fn main() -> anyhow::Result<()> {
                     commands::config::provider(logger, &ctx.config, registry, features, network)
                         .await
                 }
+                Setting { name } => commands::config::setting(&name),
             }
         }
         Remove { name } => commands::remove::run(ctx.subgraph_store(), &name),
@@ -1051,12 +1141,25 @@ async fn main() -> anyhow::Result<()> {
             let sender = ctx.notification_sender();
             commands::assign::reassign(ctx.primary_pool(), &sender, &deployment, node)
         }
+        Pause { deployment } => {
+            let sender = ctx.notification_sender();
+            commands::assign::pause_or_resume(ctx.primary_pool(), &sender, &deployment, true)
+        }
+        Resume { deployment } => {
+            let sender = ctx.notification_sender();
+            commands::assign::pause_or_resume(ctx.primary_pool(), &sender, &deployment, false)
+        }
+        Restart { deployment, sleep } => {
+            let sender = ctx.notification_sender();
+            commands::assign::restart(ctx.primary_pool(), &sender, &deployment, sleep)
+        }
         Rewind {
             force,
             sleep,
             block_hash,
             block_number,
             deployments,
+            start_block,
         } => {
             let (store, primary) = ctx.store_and_primary();
             commands::rewind::run(
@@ -1067,6 +1170,7 @@ async fn main() -> anyhow::Result<()> {
                 block_number,
                 force,
                 sleep,
+                start_block,
             )
             .await
         }
@@ -1083,6 +1187,7 @@ async fn main() -> anyhow::Result<()> {
             let store_builder = ctx.store_builder().await;
             let job_name = version_label.clone();
             let ipfs_url = ctx.ipfs_url.clone();
+            let arweave_url = ctx.arweave_url.clone();
             let metrics_ctx = MetricsContext {
                 prometheus: ctx.prometheus_registry.clone(),
                 registry: registry.clone(),
@@ -1095,6 +1200,7 @@ async fn main() -> anyhow::Result<()> {
                 store_builder,
                 network_name,
                 ipfs_url,
+                arweave_url,
                 config,
                 metrics_ctx,
                 node_id,
@@ -1303,6 +1409,7 @@ async fn main() -> anyhow::Result<()> {
                     entity,
                     fields,
                     method,
+                    after,
                 } => {
                     commands::index::create(
                         subgraph_store,
@@ -1311,6 +1418,7 @@ async fn main() -> anyhow::Result<()> {
                         &entity,
                         fields,
                         method,
+                        after,
                     )
                     .await
                 }
@@ -1366,10 +1474,21 @@ async fn main() -> anyhow::Result<()> {
         Prune {
             deployment,
             history,
-            prune_ratio,
+            rebuild_threshold,
+            delete_threshold,
+            once,
         } => {
             let (store, primary_pool) = ctx.store_and_primary();
-            commands::prune::run(store, primary_pool, deployment, history, prune_ratio).await
+            commands::prune::run(
+                store,
+                primary_pool,
+                deployment,
+                history,
+                rebuild_threshold,
+                delete_threshold,
+                once,
+            )
+            .await
         }
         Drop {
             deployment,

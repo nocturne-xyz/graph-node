@@ -141,8 +141,6 @@ where
             Err(e) => return Ok(QueryResults::from(QueryResult::from(e))),
         };
 
-        let load_manager = self.graphql_runner.load_manager();
-
         // Run the query using the index node resolver
         let query_clone = query.cheap_clone();
         let logger = self.logger.cheap_clone();
@@ -159,7 +157,6 @@ where
                 deadline: None,
                 max_first: std::u32::MAX,
                 max_skip: std::u32::MAX,
-                load_manager,
                 trace: false,
             };
             let result = execute_query(query_clone.cheap_clone(), None, None, options).await;
@@ -374,7 +371,10 @@ impl ValidatedRequest {
 
 #[cfg(test)]
 mod tests {
-    use graph::{data::value::Object, prelude::*};
+    use graph::{
+        data::value::{Object, Word},
+        prelude::*,
+    };
 
     use hyper::body::Bytes;
     use hyper::HeaderMap;
@@ -474,7 +474,7 @@ mod tests {
                 (
                     String::from("map"),
                     r::Value::Object(Object::from_iter(
-                        vec![(String::from("k"), r::Value::String(String::from("v")))].into_iter(),
+                        vec![(Word::from("k"), r::Value::String(String::from("v")))].into_iter(),
                     )),
                 ),
                 (String::from("int"), r::Value::Int(5)),

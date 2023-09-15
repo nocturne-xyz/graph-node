@@ -190,8 +190,10 @@ impl QueryResults {
 
     pub fn as_http_response<T: From<String>>(&self) -> http::Response<T> {
         let status_code = http::StatusCode::OK;
+
         let json =
             serde_json::to_string(self).expect("Failed to serialize GraphQL response to JSON");
+
         http::Response::builder()
             .status(status_code)
             .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
@@ -371,7 +373,10 @@ fn multiple_data_items() {
     use serde_json::json;
 
     fn make_obj(key: &str, value: &str) -> Arc<QueryResult> {
-        let obj = Object::from_iter([(key.to_owned(), r::Value::String(value.to_owned()))]);
+        let obj = Object::from_iter([(
+            crate::data::value::Word::from(key),
+            r::Value::String(value.to_owned()),
+        )]);
         Arc::new(obj.into())
     }
 

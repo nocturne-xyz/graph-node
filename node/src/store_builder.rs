@@ -1,10 +1,10 @@
+use std::collections::BTreeMap;
 use std::iter::FromIterator;
 use std::{collections::HashMap, sync::Arc};
 
 use futures::future::join_all;
 use graph::blockchain::ChainIdentifier;
-use graph::components::metrics::MetricsRegistryTrait;
-use graph::prelude::{o, NodeId};
+use graph::prelude::{o, MetricsRegistry, NodeId};
 use graph::url::Url;
 use graph::{
     prelude::{info, CheapClone, Logger},
@@ -15,7 +15,7 @@ use graph_store_postgres::connection_pool::{
 };
 use graph_store_postgres::{
     BlockStore as DieselBlockStore, ChainHeadUpdateListener as PostgresChainHeadUpdateListener,
-    NotificationSender, Shard as ShardName, Store as DieselStore, SubgraphStore,
+    ChainStoreMetrics, NotificationSender, Shard as ShardName, Store as DieselStore, SubgraphStore,
     SubscriptionManager, PRIMARY_SHARD,
 };
 
@@ -30,6 +30,7 @@ pub struct StoreBuilder {
     /// Map network names to the shards where they are/should be stored
     chains: HashMap<String, ShardName>,
     pub coord: Arc<PoolCoordinator>,
+    registry: Arc<MetricsRegistry>,
 }
 
 impl StoreBuilder {
@@ -41,7 +42,7 @@ impl StoreBuilder {
         node: &NodeId,
         config: &Config,
         fork_base: Option<Url>,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
     ) -> Self {
         let primary_shard = config.primary_store().clone();
 
@@ -85,6 +86,7 @@ impl StoreBuilder {
             chain_head_update_listener,
             chains,
             coord,
+            registry,
         }
     }
 
@@ -96,7 +98,7 @@ impl StoreBuilder {
         node: &NodeId,
         config: &Config,
         fork_base: Option<Url>,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
     ) -> (
         Arc<SubgraphStore>,
         HashMap<ShardName, ConnectionPool>,
@@ -165,7 +167,8 @@ impl StoreBuilder {
         pools: HashMap<ShardName, ConnectionPool>,
         subgraph_store: Arc<SubgraphStore>,
         chains: HashMap<String, ShardName>,
-        networks: Vec<(String, Vec<ChainIdentifier>)>,
+        networks: BTreeMap<String, ChainIdentifier>,
+        registry: Arc<MetricsRegistry>,
     ) -> Arc<DieselStore> {
         let networks = networks
             .into_iter()
@@ -177,12 +180,14 @@ impl StoreBuilder {
 
         let logger = logger.new(o!("component" => "BlockStore"));
 
+        let chain_store_metrics = Arc::new(ChainStoreMetrics::new(registry));
         let block_store = Arc::new(
             DieselBlockStore::new(
                 logger,
                 networks,
                 pools,
                 subgraph_store.notification_sender(),
+                chain_store_metrics,
             )
             .expect("Creating the BlockStore works"),
         );
@@ -200,7 +205,7 @@ impl StoreBuilder {
         node: &NodeId,
         name: &str,
         shard: &Shard,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
         coord: Arc<PoolCoordinator>,
     ) -> ConnectionPool {
         let logger = logger.new(o!("pool" => "main"));
@@ -236,7 +241,7 @@ impl StoreBuilder {
         node: &NodeId,
         name: &str,
         shard: &Shard,
-        registry: Arc<dyn MetricsRegistryTrait>,
+        registry: Arc<MetricsRegistry>,
         coord: Arc<PoolCoordinator>,
     ) -> (Vec<ConnectionPool>, Vec<usize>) {
         let mut weights: Vec<_> = vec![shard.weight];
@@ -276,13 +281,14 @@ impl StoreBuilder {
 
     /// Return a store that combines both a `Store` for subgraph data
     /// and a `BlockStore` for all chain related data
-    pub fn network_store(self, networks: Vec<(String, Vec<ChainIdentifier>)>) -> Arc<DieselStore> {
+    pub fn network_store(self, networks: BTreeMap<String, ChainIdentifier>) -> Arc<DieselStore> {
         Self::make_store(
             &self.logger,
             self.pools,
             self.subgraph_store,
             self.chains,
             networks,
+            self.registry,
         )
     }
 

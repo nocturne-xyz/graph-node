@@ -1,16 +1,18 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use graph::{
-    anyhow::bail,
-    components::metrics::MetricsRegistryTrait,
+    anyhow::{bail, Context},
+    components::subgraph::{Setting, Settings},
+    endpoint::EndpointMetrics,
+    env::EnvVars,
     itertools::Itertools,
     prelude::{
         anyhow::{anyhow, Error},
-        NodeId,
+        MetricsRegistry, NodeId, SubgraphName,
     },
     slog::Logger,
 };
-use graph_chain_ethereum::{EthereumAdapterTrait, NodeCapabilities, ProviderEthRpcMetrics};
+use graph_chain_ethereum::{NodeCapabilities, ProviderEthRpcMetrics};
 use graph_store_postgres::DeploymentPlacer;
 
 use crate::{chain::create_ethereum_networks_for_chain, config::Config};
@@ -39,13 +41,27 @@ pub fn check(config: &Config, print: bool) -> Result<(), Error> {
         Ok(txt) => {
             if print {
                 println!("{}", txt);
-            } else {
-                println!("Successfully validated configuration");
+                return Ok(());
             }
-            Ok(())
         }
-        Err(e) => Err(anyhow!("error serializing config: {}", e)),
+        Err(e) => bail!("error serializing config: {}", e),
     }
+
+    let env_vars = EnvVars::from_env().unwrap();
+    if let Some(path) = &env_vars.subgraph_settings {
+        match Settings::from_file(path) {
+            Ok(_) => {
+                println!("Successfully validated subgraph settings from {path}");
+            }
+            Err(e) => {
+                eprintln!("configuration error in subgraph settings {}: {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    println!("Successfully validated configuration");
+    Ok(())
 }
 
 pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Error> {
@@ -100,7 +116,7 @@ pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Err
 pub async fn provider(
     logger: Logger,
     config: &Config,
-    registry: Arc<dyn MetricsRegistryTrait>,
+    registry: Arc<MetricsRegistry>,
     features: String,
     network: String,
 ) -> Result<(), Error> {
@@ -120,10 +136,12 @@ pub async fn provider(
         Ok(caps)
     }
 
+    let metrics = Arc::new(EndpointMetrics::mock());
     let caps = caps_from_features(features)?;
     let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
     let networks =
-        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, config, &network).await?;
+        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, config, &network, metrics)
+            .await?;
     let adapters = networks
         .networks
         .get(&network)
@@ -138,5 +156,27 @@ pub async fn provider(
             .map(|adapter| adapter.provider().to_string())
             .join(", ")
     );
+    Ok(())
+}
+
+pub fn setting(name: &str) -> Result<(), Error> {
+    let name = SubgraphName::new(name).map_err(|()| anyhow!("illegal subgraph name `{}`", name))?;
+    let env_vars = EnvVars::from_env().unwrap();
+    if let Some(path) = &env_vars.subgraph_settings {
+        let settings = Settings::from_file(path)
+            .with_context(|| format!("syntax error in subgraph settings `{}`", path))?;
+        match settings.for_name(&name) {
+            Some(Setting { history_blocks, .. }) => {
+                println!("setting for `{name}` will use history_blocks = {history_blocks}");
+            }
+            None => {
+                println!("no specific setting for `{name}`, defaults will be used");
+            }
+        }
+    } else {
+        println!("No subgraph-specific settings will be applied because");
+        println!("GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS is not set");
+    };
+
     Ok(())
 }

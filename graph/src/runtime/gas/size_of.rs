@@ -1,9 +1,8 @@
 //! Various implementations of GasSizeOf;
 
 use crate::{
-    components::store::{EntityKey, EntityType},
+    components::store::{EntityKey, EntityType, LoadRelatedRequest},
     data::store::{scalar::Bytes, Value},
-    prelude::{BigDecimal, BigInt},
 };
 
 use super::{Gas, GasSizeOf, SaturatingInto as _};
@@ -16,6 +15,7 @@ impl GasSizeOf for Value {
             Value::Null => Gas(1),
             Value::List(list) => list.gas_size_of(),
             Value::Int(int) => int.gas_size_of(),
+            Value::Int8(int) => int.gas_size_of(),
             Value::Bytes(bytes) => bytes.gas_size_of(),
             Value::Bool(bool) => bool.gas_size_of(),
             Value::BigInt(big_int) => big_int.gas_size_of(),
@@ -47,22 +47,6 @@ where
         } else {
             Gas(1)
         }
-    }
-}
-
-impl GasSizeOf for BigInt {
-    fn gas_size_of(&self) -> Gas {
-        // Add one to always have an upper bound on the number of bytes required to represent the
-        // number, and so that `0` has a size of 1.
-        let n_bytes = self.bits() / 8 + 1;
-        n_bytes.saturating_into()
-    }
-}
-
-impl GasSizeOf for BigDecimal {
-    fn gas_size_of(&self) -> Gas {
-        let (int, _) = self.as_bigint_and_exponent();
-        BigInt::from(int).gas_size_of()
     }
 }
 
@@ -165,6 +149,14 @@ impl GasSizeOf for usize {
 impl GasSizeOf for EntityKey {
     fn gas_size_of(&self) -> Gas {
         self.entity_type.gas_size_of() + self.entity_id.gas_size_of()
+    }
+}
+
+impl GasSizeOf for LoadRelatedRequest {
+    fn gas_size_of(&self) -> Gas {
+        self.entity_type.gas_size_of()
+            + self.entity_id.gas_size_of()
+            + self.entity_field.gas_size_of()
     }
 }
 
