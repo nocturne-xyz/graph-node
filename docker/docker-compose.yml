@@ -19,7 +19,7 @@ services:
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'mainnet:http://host.docker.internal:8545'
+      ethereum: 'mainnet:${RPC_URL}'
       GRAPH_LOG: info
       ETHEREUM_REORG_THRESHOLD: 100000
   ipfs:
